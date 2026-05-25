@@ -60,6 +60,15 @@ func (b *DeploymentBuilder) ForWireguard(wg *v1alpha1.Wireguard) (*appsv1.Deploy
 	allowPrivilegeEscalation := false
 	automountServiceAccountToken := false
 
+	strategy := appsv1.DeploymentStrategy{Type: appsv1.RollingUpdateDeploymentStrategyType}
+	if wg.Spec.DeploymentStrategy != nil {
+		strategy = *wg.Spec.DeploymentStrategy
+		if strategy.Type == appsv1.RecreateDeploymentStrategyType {
+			// K8s API rejects spec.strategy.rollingUpdate when type=Recreate
+			strategy.RollingUpdate = nil
+		}
+	}
+
 	dep := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      wg.Name + "-dep",
@@ -68,6 +77,7 @@ func (b *DeploymentBuilder) ForWireguard(wg *v1alpha1.Wireguard) (*appsv1.Deploy
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: &replicas,
+			Strategy: strategy,
 			Selector: &metav1.LabelSelector{
 				MatchLabels: ls,
 			},

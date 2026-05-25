@@ -21,9 +21,11 @@ import (
 	"testing"
 
 	"github.com/nccloud/wireguard-operator/api/v1alpha1"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 func newTestDeploymentBuilder(t *testing.T) *DeploymentBuilder {
@@ -120,5 +122,97 @@ func TestDeploymentAgentListenPortCustom(t *testing.T) {
 		if strings.TrimSpace(tok) == "51820" {
 			t.Fatalf("unexpected literal 51820 token in agent command when AgentListenPort=51821: %v", agent.Command)
 		}
+	}
+}
+
+func TestDeploymentStrategyDefault(t *testing.T) {
+	b := newTestDeploymentBuilder(t)
+	wg := newTestWireguard(v1alpha1.WireguardSpec{})
+
+	dep, err := b.ForWireguard(wg)
+	if err != nil {
+		t.Fatalf("ForWireguard returned error: %v", err)
+	}
+
+	if dep.Spec.Strategy.Type != appsv1.RollingUpdateDeploymentStrategyType {
+		t.Fatalf("unset DeploymentStrategy must default to RollingUpdate for backwards-compat; got %q", dep.Spec.Strategy.Type)
+	}
+}
+
+func TestDeploymentStrategyCustomRecreate(t *testing.T) {
+	b := newTestDeploymentBuilder(t)
+	wg := newTestWireguard(v1alpha1.WireguardSpec{
+		DeploymentStrategy: &appsv1.DeploymentStrategy{
+			Type: appsv1.RecreateDeploymentStrategyType,
+		},
+	})
+
+	dep, err := b.ForWireguard(wg)
+	if err != nil {
+		t.Fatalf("ForWireguard returned error: %v", err)
+	}
+
+	if dep.Spec.Strategy.Type != appsv1.RecreateDeploymentStrategyType {
+		t.Fatalf("expected Recreate strategy when configured; got %q", dep.Spec.Strategy.Type)
+	}
+	if dep.Spec.Strategy.RollingUpdate != nil {
+		t.Fatalf("Recreate strategy must NOT carry a RollingUpdate block — API rejects it as Forbidden; got %+v", dep.Spec.Strategy.RollingUpdate)
+	}
+}
+
+func TestDeploymentStrategyCustomRecreateClearsRollingUpdate(t *testing.T) {
+	// Even if a caller passes a RollingUpdate block alongside Type=Recreate
+	// (which the API would reject), the builder must defensively clear it.
+	b := newTestDeploymentBuilder(t)
+	maxSurge := intstr.FromInt(1)
+	maxUnavailable := intstr.FromInt(0)
+	wg := newTestWireguard(v1alpha1.WireguardSpec{
+		DeploymentStrategy: &appsv1.DeploymentStrategy{
+			Type: appsv1.RecreateDeploymentStrategyType,
+			RollingUpdate: &appsv1.RollingUpdateDeployment{
+				MaxSurge:       &maxSurge,
+				MaxUnavailable: &maxUnavailable,
+			},
+		},
+	})
+
+	dep, err := b.ForWireguard(wg)
+	if err != nil {
+		t.Fatalf("ForWireguard returned error: %v", err)
+	}
+	if dep.Spec.Strategy.Type != appsv1.RecreateDeploymentStrategyType {
+		t.Fatalf("expected Recreate; got %q", dep.Spec.Strategy.Type)
+	}
+	if dep.Spec.Strategy.RollingUpdate != nil {
+		t.Fatalf("builder must clear RollingUpdate when Type=Recreate; got %+v", dep.Spec.Strategy.RollingUpdate)
+	}
+}
+
+func TestDeploymentStrategyCustomRollingUpdatePreserved(t *testing.T) {
+	b := newTestDeploymentBuilder(t)
+	maxSurge := intstr.FromInt(2)
+	maxUnavailable := intstr.FromInt(0)
+	wg := newTestWireguard(v1alpha1.WireguardSpec{
+		DeploymentStrategy: &appsv1.DeploymentStrategy{
+			Type: appsv1.RollingUpdateDeploymentStrategyType,
+			RollingUpdate: &appsv1.RollingUpdateDeployment{
+				MaxSurge:       &maxSurge,
+				MaxUnavailable: &maxUnavailable,
+			},
+		},
+	})
+
+	dep, err := b.ForWireguard(wg)
+	if err != nil {
+		t.Fatalf("ForWireguard returned error: %v", err)
+	}
+	if dep.Spec.Strategy.Type != appsv1.RollingUpdateDeploymentStrategyType {
+		t.Fatalf("expected RollingUpdate; got %q", dep.Spec.Strategy.Type)
+	}
+	if dep.Spec.Strategy.RollingUpdate == nil {
+		t.Fatalf("expected RollingUpdate block to be preserved")
+	}
+	if dep.Spec.Strategy.RollingUpdate.MaxSurge == nil || dep.Spec.Strategy.RollingUpdate.MaxSurge.IntValue() != 2 {
+		t.Fatalf("expected MaxSurge=2; got %+v", dep.Spec.Strategy.RollingUpdate.MaxSurge)
 	}
 }

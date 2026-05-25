@@ -19,6 +19,7 @@ package v1alpha1
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 )
 
@@ -78,6 +79,14 @@ type WireguardSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=65535
 	ExternalPort *int32 `json:"externalPort,omitempty"`
+	// DeploymentStrategy overrides the operator's default RollingUpdate
+	// strategy on the wireguard-dep Deployment. Set Type: Recreate when
+	// the WG pod's IP is pinned (e.g. via a CNI ip_address annotation)
+	// so the rollout doesn't deadlock on a pinned-IP conflict between
+	// the old pod (still alive under RollingUpdate maxUnavailable=25%)
+	// and the new pod (waiting for the IP).
+	// +optional
+	DeploymentStrategy *appsv1.DeploymentStrategy `json:"deploymentStrategy,omitempty"`
 	// A map of key value strings for service annotations
 	ServiceAnnotations map[string]string `json:"serviceAnnotations,omitempty"`
 	// A boolean field that specifies whether IP forwarding should be enabled on the Wireguard VPN pod at startup. This can be useful to enable if the peers are having problems with sending traffic to the internet.
