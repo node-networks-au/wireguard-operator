@@ -140,6 +140,10 @@ func (b *DeploymentBuilder) ForWireguard(wg *v1alpha1.Wireguard) (*appsv1.Deploy
 
 // agentContainer creates the agent container for the deployment.
 func (b *DeploymentBuilder) agentContainer(wg *v1alpha1.Wireguard, readOnlyRootFilesystem, allowPrivilegeEscalation bool) corev1.Container {
+	listenPort := int32(WireguardPort)
+	if wg.Spec.AgentListenPort != nil {
+		listenPort = *wg.Spec.AgentListenPort
+	}
 	return corev1.Container{
 		SecurityContext: &corev1.SecurityContext{
 			ReadOnlyRootFilesystem:   &readOnlyRootFilesystem,
@@ -153,7 +157,7 @@ func (b *DeploymentBuilder) agentContainer(wg *v1alpha1.Wireguard, readOnlyRootF
 			"agent",
 			"--v", "11",
 			"--wg-iface", "wg0",
-			"--wg-listen-port", fmt.Sprintf("%d", WireguardPort),
+			"--wg-listen-port", fmt.Sprintf("%d", listenPort),
 			"--state", "/tmp/wireguard/state.json",
 			"--wg-userspace-implementation-fallback", "wireguard-go",
 		},

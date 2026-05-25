@@ -57,6 +57,16 @@ type WireguardSpec struct {
 	ServiceType corev1.ServiceType `json:"serviceType,omitempty"`
 	// A field that specifies the value to use for a nodePort ServiceType
 	NodePort int32 `json:"port,omitempty"`
+	// AgentListenPort overrides the UDP port the wireguard agent listens on
+	// inside the pod (the agent's --wg-listen-port flag). If unset, the agent
+	// listens on 51820 (the upstream default). Use this when the tenant's
+	// external port differs from 51820 AND OVN/CNI source-NAT-preserves the
+	// pod's UDP source port — without alignment, peers observe a mismatched
+	// reply source port and lock onto the wrong endpoint-port.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	AgentListenPort *int32 `json:"agentListenPort,omitempty"`
 	// A map of key value strings for service annotations
 	ServiceAnnotations map[string]string `json:"serviceAnnotations,omitempty"`
 	// A boolean field that specifies whether IP forwarding should be enabled on the Wireguard VPN pod at startup. This can be useful to enable if the peers are having problems with sending traffic to the internet.
