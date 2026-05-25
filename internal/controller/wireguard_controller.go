@@ -353,7 +353,7 @@ Endpoint = 127.0.0.1:%d
 PublicKey = %s
 AllowedIPs = %s
 Endpoint = %s:%s
-`, serverPublicKey, allowIps, serverAddress, wireguard.Status.Port)
+`, serverPublicKey, allowIps, serverAddress, resources.PeerEndpointPort(wireguard))
 						newPeerCfgData[peer.Name] = []byte(directCfg)
 						newPeerCfgData[peer.Name+".tunnel"] = []byte(tunnelCfg)
 					} else {
@@ -367,7 +367,7 @@ Endpoint = %s:%s
 PublicKey = %s
 AllowedIPs = %s
 Endpoint = %s:%s
-`, serverPublicKey, allowIps, serverAddress, wireguard.Status.Port)
+`, serverPublicKey, allowIps, serverAddress, resources.PeerEndpointPort(wireguard))
 					newPeerCfgData[peer.Name] = []byte(pureCfg)
 				}
 			}

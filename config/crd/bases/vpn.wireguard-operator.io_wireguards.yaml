@@ -136,6 +136,19 @@ spec:
                   A string field that specifies the external address where peers should connect to this Wireguard instance.
                   When set, this is used for peer endpoints instead of Address or Service status.
                 type: string
+              externalPort:
+                description: |-
+                  ExternalPort overrides the port written into the wg-quick blob's
+                  Endpoint line (peer-side `Endpoint = <ExternalAddress>:<port>`). If
+                  unset, the operator falls back to Status.Port (the agent's own
+                  listen port, default 51820). Set this to the LoadBalancer Service's
+                  external port when sharing a single EIP across tenants with
+                  per-tenant UDP-port demux — without it, the downloaded wg-quick
+                  blob points peers at the wrong port.
+                format: int32
+                maximum: 65535
+                minimum: 1
+                type: integer
               ipv6Only:
                 description: |-
                   IPv6Only indicates that only IPv6 connectivity should be configured for peers.

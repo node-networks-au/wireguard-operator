@@ -57,6 +57,17 @@ type WireguardSpec struct {
 	ServiceType corev1.ServiceType `json:"serviceType,omitempty"`
 	// A field that specifies the value to use for a nodePort ServiceType
 	NodePort int32 `json:"port,omitempty"`
+	// ExternalPort overrides the port written into the wg-quick blob's
+	// Endpoint line (peer-side `Endpoint = <ExternalAddress>:<port>`). If
+	// unset, the operator falls back to Status.Port (the agent's own
+	// listen port, default 51820). Set this to the LoadBalancer Service's
+	// external port when sharing a single EIP across tenants with
+	// per-tenant UDP-port demux — without it, the downloaded wg-quick
+	// blob points peers at the wrong port.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	ExternalPort *int32 `json:"externalPort,omitempty"`
 	// A map of key value strings for service annotations
 	ServiceAnnotations map[string]string `json:"serviceAnnotations,omitempty"`
 	// A boolean field that specifies whether IP forwarding should be enabled on the Wireguard VPN pod at startup. This can be useful to enable if the peers are having problems with sending traffic to the internet.
