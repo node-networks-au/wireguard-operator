@@ -340,6 +340,11 @@ func (in *WireguardSpec) DeepCopyInto(out *WireguardSpec) {
 		*out = new(int32)
 		**out = **in
 	}
+	if in.ExternalPort != nil {
+		in, out := &in.ExternalPort, &out.ExternalPort
+		*out = new(int32)
+		**out = **in
+	}
 	if in.ServiceAnnotations != nil {
 		in, out := &in.ServiceAnnotations, &out.ServiceAnnotations
 		*out = make(map[string]string, len(*in))
