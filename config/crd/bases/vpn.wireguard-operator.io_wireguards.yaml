@@ -117,6 +117,18 @@ spec:
                         type: object
                     type: object
                 type: object
+              agentListenPort:
+                description: |-
+                  AgentListenPort overrides the UDP port the wireguard agent listens on
+                  inside the pod (the agent's --wg-listen-port flag). If unset, the agent
+                  listens on 51820 (the upstream default). Use this when the tenant's
+                  external port differs from 51820 AND OVN/CNI source-NAT-preserves the
+                  pod's UDP source port — without alignment, peers observe a mismatched
+                  reply source port and lock onto the wrong endpoint-port.
+                format: int32
+                maximum: 65535
+                minimum: 1
+                type: integer
               dns:
                 description: A string field that specifies the DNS server(s) to be
                   used by the peers.
