@@ -59,6 +59,19 @@ type WireguardPeerSpec struct {
 	EgressNetworkPolicies EgressNetworkPolicies `json:"egressNetworkPolicies,omitempty"`
 	DownloadSpeed         Speed                 `json:"downloadSpeed,omitempty"`
 	UploadSpeed           Speed                 `json:"uploadSpeed,omitempty"`
+	// Routes are downstream IPv4 CIDRs reachable through this peer. They
+	// are appended to the server-side [Peer].AllowedIPs CSV so wg0 will
+	// accept and forward packets for those CIDRs to/from this peer, and
+	// they are installed as netlink routes inside the WG pod's netns with
+	// the peer's WG address as nexthop, so the kernel forwards replies back
+	// down the tunnel. Related prior art: nccloud/wireguard-operator#1 by
+	// PetzJohannes.
+	// +optional
+	Routes []string `json:"routes,omitempty"`
+	// RoutesV6 are downstream IPv6 CIDRs reachable through this peer.
+	// See Routes for full semantics.
+	// +optional
+	RoutesV6 []string `json:"routesV6,omitempty"`
 }
 
 type EgressNetworkPolicies []EgressNetworkPolicy
