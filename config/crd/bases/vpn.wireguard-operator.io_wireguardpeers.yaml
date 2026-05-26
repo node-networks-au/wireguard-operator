@@ -162,6 +162,28 @@ spec:
                 description: The key used by the peer to authenticate with the wg
                   server.
                 type: string
+              routes:
+                description: |-
+                  Routes are downstream IPv4 CIDRs reachable through this peer. They
+                  are appended to the server-side [Peer].AllowedIPs CSV so wg0 will
+                  accept and forward packets for those CIDRs to/from this peer. In
+                  PetzJohannes' upstream PR these CIDRs were also installed as
+                  netlink routes on the WG pod's netns pointing at the peer's WG
+                  address as nexthop — that piece is deferred in our fork because
+                  kube-ovn policyRoutes already steer cluster-side traffic for those
+                  CIDRs to the wireguard service IP. Adapted from
+                  https://github.com/nccloud/wireguard-operator/pull/1 by
+                  PetzJohannes.
+                items:
+                  type: string
+                type: array
+              routesV6:
+                description: |-
+                  RoutesV6 are downstream IPv6 CIDRs reachable through this peer.
+                  See Routes for full semantics.
+                items:
+                  type: string
+                type: array
               uploadSpeed:
                 properties:
                   config:

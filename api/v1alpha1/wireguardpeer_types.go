@@ -69,6 +69,22 @@ type WireguardPeerSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=65535
 	PersistentKeepalive *int32 `json:"persistentKeepalive,omitempty"`
+	// Routes are downstream IPv4 CIDRs reachable through this peer. They
+	// are appended to the server-side [Peer].AllowedIPs CSV so wg0 will
+	// accept and forward packets for those CIDRs to/from this peer. In
+	// PetzJohannes' upstream PR these CIDRs were also installed as
+	// netlink routes on the WG pod's netns pointing at the peer's WG
+	// address as nexthop — that piece is deferred in our fork because
+	// kube-ovn policyRoutes already steer cluster-side traffic for those
+	// CIDRs to the wireguard service IP. Adapted from
+	// https://github.com/nccloud/wireguard-operator/pull/1 by
+	// PetzJohannes.
+	// +optional
+	Routes []string `json:"routes,omitempty"`
+	// RoutesV6 are downstream IPv6 CIDRs reachable through this peer.
+	// See Routes for full semantics.
+	// +optional
+	RoutesV6 []string `json:"routesV6,omitempty"`
 }
 
 type EgressNetworkPolicies []EgressNetworkPolicy

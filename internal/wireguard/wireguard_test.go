@@ -206,6 +206,131 @@ func TestBuildWgQuickConfig_OmitsPersistentKeepaliveWhenUnset(t *testing.T) {
 	}
 }
 
+// TestBuildWgQuickConfig_RoutesAppendedToAllowedIPs locks down Phase G: when
+// WireguardPeer.spec.routes is set, the rendered server-side [Peer] AllowedIPs
+// CSV must include the peer's own /32 PLUS every CIDR in Routes. This is what
+// lets wg0 accept and route packets for downstream LANs reachable through the
+// peer — without it the kernel drops anything that doesn't match an explicit
+// AllowedIP. Adapted from PetzJohannes' PR #1.
+func TestBuildWgQuickConfig_RoutesAppendedToAllowedIPs(t *testing.T) {
+	state := agent.State{
+		ServerPrivateKey: validServerPrivateKey,
+		Server:           v1alpha1.Wireguard{},
+		Peers: []v1alpha1.WireguardPeer{
+			{
+				Spec: v1alpha1.WireguardPeerSpec{
+					PublicKey:  validPeerPublicKey,
+					Address:    "172.31.255.11",
+					AllowedIPs: "172.31.255.11/32",
+					Routes:     []string{"10.254.11.0/24", "192.168.42.0/24"},
+				},
+			},
+		},
+	}
+
+	cfg, err := BuildWgQuickConfig(state, 51820)
+	if err != nil {
+		t.Fatalf("BuildWgQuickConfig: %v", err)
+	}
+
+	for _, want := range []string{"172.31.255.11/32", "10.254.11.0/24", "192.168.42.0/24"} {
+		if !strings.Contains(cfg, want) {
+			t.Errorf("expected CIDR %q in AllowedIPs:\n%s", want, cfg)
+		}
+	}
+}
+
+// TestBuildWgQuickConfig_RoutesV6AppendedToAllowedIPs is the IPv6 counterpart.
+func TestBuildWgQuickConfig_RoutesV6AppendedToAllowedIPs(t *testing.T) {
+	state := agent.State{
+		ServerPrivateKey: validServerPrivateKey,
+		Server:           v1alpha1.Wireguard{},
+		Peers: []v1alpha1.WireguardPeer{
+			{
+				Spec: v1alpha1.WireguardPeerSpec{
+					PublicKey:  validPeerPublicKey,
+					AddressV6:  "fd00:255::11",
+					AllowedIPs: "fd00:255::11/128",
+					RoutesV6:   []string{"fd00:254:11::/64"},
+				},
+			},
+		},
+	}
+
+	cfg, err := BuildWgQuickConfig(state, 51820)
+	if err != nil {
+		t.Fatalf("BuildWgQuickConfig: %v", err)
+	}
+
+	for _, want := range []string{"fd00:255::11/128", "fd00:254:11::/64"} {
+		if !strings.Contains(cfg, want) {
+			t.Errorf("expected CIDR %q in AllowedIPs:\n%s", want, cfg)
+		}
+	}
+}
+
+// TestBuildWgQuickConfig_RoutesAppendedToDefaultAllowedIPs covers the path where
+// the operator hasn't set spec.allowedIPs at all — the default `<addr>/32`
+// derivation must still get Routes appended (otherwise Routes is silently lost
+// for peers that rely on the implicit /32).
+func TestBuildWgQuickConfig_RoutesAppendedToDefaultAllowedIPs(t *testing.T) {
+	state := agent.State{
+		ServerPrivateKey: validServerPrivateKey,
+		Server:           v1alpha1.Wireguard{},
+		Peers: []v1alpha1.WireguardPeer{
+			{
+				Spec: v1alpha1.WireguardPeerSpec{
+					PublicKey: validPeerPublicKey,
+					Address:   "172.31.255.11",
+					// no spec.AllowedIPs — falls through to default /32
+					Routes: []string{"10.254.11.0/24"},
+				},
+			},
+		},
+	}
+
+	cfg, err := BuildWgQuickConfig(state, 51820)
+	if err != nil {
+		t.Fatalf("BuildWgQuickConfig: %v", err)
+	}
+
+	if !strings.Contains(cfg, "172.31.255.11/32") {
+		t.Errorf("config missing peer /32:\n%s", cfg)
+	}
+	if !strings.Contains(cfg, "10.254.11.0/24") {
+		t.Errorf("config missing Route CIDR:\n%s", cfg)
+	}
+}
+
+// TestBuildWgQuickConfig_EmptyRoutesUnchanged guards backwards compat: a peer
+// with no Routes set must produce a [Peer] line identical to what Phase E/F
+// produced, with no trailing comma and no extra CIDRs.
+func TestBuildWgQuickConfig_EmptyRoutesUnchanged(t *testing.T) {
+	state := agent.State{
+		ServerPrivateKey: validServerPrivateKey,
+		Server:           v1alpha1.Wireguard{},
+		Peers: []v1alpha1.WireguardPeer{
+			{
+				Spec: v1alpha1.WireguardPeerSpec{
+					PublicKey:  validPeerPublicKey,
+					Address:    "172.31.255.11",
+					AllowedIPs: "172.31.255.11/32",
+					// Routes/RoutesV6 unset
+				},
+			},
+		},
+	}
+
+	cfg, err := BuildWgQuickConfig(state, 51820)
+	if err != nil {
+		t.Fatalf("BuildWgQuickConfig: %v", err)
+	}
+
+	if !strings.Contains(cfg, "AllowedIPs = 172.31.255.11/32\n") {
+		t.Errorf("expected exact `AllowedIPs = 172.31.255.11/32` with no trailing CIDRs:\n%s", cfg)
+	}
+}
+
 // TestBuildWgQuickConfig_TrimsAllowedIPsWhitespace covers the common case where
 // ops paste a CSV with spaces — `172.31.255.11/32, 10.254.0.0/16`. wg syncconf
 // is strict about CSV format; we must normalize.
