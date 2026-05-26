@@ -141,6 +141,71 @@ func TestBuildWgQuickConfig_SkipsDisabledAndEmptyKeys(t *testing.T) {
 	}
 }
 
+// TestBuildWgQuickConfig_IncludesPersistentKeepalive locks down Phase F: when
+// WireguardPeer.spec.persistentKeepalive is set, the rendered server-side wg
+// config must emit a `PersistentKeepalive = <N>` line inside the [Peer] block.
+// Without it the server doesn't send keep-alives, conntrack entries for the
+// OVN egress NAT expire after the kernel's UDP timeout, and replies destined
+// for the peer get dropped by the conntrack-based SNAT. Setting the field on
+// the server side ensures the server itself emits keepalives — necessary even
+// though the peer also has it set, because conntrack expiration is a function
+// of the LAST packet seen in either direction.
+func TestBuildWgQuickConfig_IncludesPersistentKeepalive(t *testing.T) {
+	keepalive := int32(25)
+	state := agent.State{
+		ServerPrivateKey: validServerPrivateKey,
+		Server:           v1alpha1.Wireguard{},
+		Peers: []v1alpha1.WireguardPeer{
+			{
+				Spec: v1alpha1.WireguardPeerSpec{
+					PublicKey:           validPeerPublicKey,
+					Address:             "172.31.255.11",
+					PersistentKeepalive: &keepalive,
+				},
+			},
+		},
+	}
+
+	cfg, err := BuildWgQuickConfig(state, 51820)
+	if err != nil {
+		t.Fatalf("BuildWgQuickConfig: %v", err)
+	}
+
+	if !strings.Contains(cfg, "PersistentKeepalive = 25") {
+		t.Errorf("config missing PersistentKeepalive line:\n%s", cfg)
+	}
+}
+
+// TestBuildWgQuickConfig_OmitsPersistentKeepaliveWhenUnset locks down backwards
+// compatibility: peers without the new field (the entire installed fleet at
+// rollout time) must produce a [Peer] block with no PersistentKeepalive line.
+// `wg syncconf` treats an absent PersistentKeepalive as "0" (disabled), and
+// emitting a stray line would either error on parse or — worse — silently
+// re-enable keepalives ops never asked for.
+func TestBuildWgQuickConfig_OmitsPersistentKeepaliveWhenUnset(t *testing.T) {
+	state := agent.State{
+		ServerPrivateKey: validServerPrivateKey,
+		Server:           v1alpha1.Wireguard{},
+		Peers: []v1alpha1.WireguardPeer{
+			{
+				Spec: v1alpha1.WireguardPeerSpec{
+					PublicKey: validPeerPublicKey,
+					Address:   "172.31.255.11",
+				},
+			},
+		},
+	}
+
+	cfg, err := BuildWgQuickConfig(state, 51820)
+	if err != nil {
+		t.Fatalf("BuildWgQuickConfig: %v", err)
+	}
+
+	if strings.Contains(cfg, "PersistentKeepalive") {
+		t.Errorf("PersistentKeepalive must NOT appear when the field is unset:\n%s", cfg)
+	}
+}
+
 // TestBuildWgQuickConfig_TrimsAllowedIPsWhitespace covers the common case where
 // ops paste a CSV with spaces — `172.31.255.11/32, 10.254.0.0/16`. wg syncconf
 // is strict about CSV format; we must normalize.

@@ -412,6 +412,16 @@ func BuildWgQuickConfig(state agent.State, listenPort int) (string, error) {
 		}
 
 		fmt.Fprintf(&b, "\n[Peer]\nPublicKey = %s\nAllowedIPs = %s\n", peer.Spec.PublicKey, allowed)
+
+		// PersistentKeepalive on the server-side [Peer] block is what makes the
+		// server emit keep-alives even when the application is idle; the OVN
+		// egress NAT's conntrack entries expire ~30s after the last packet in
+		// either direction, so the server must keep the flow alive or replies
+		// to peer-initiated traffic stop coming back. Backwards-compat: omit
+		// the line entirely when the field is unset.
+		if peer.Spec.PersistentKeepalive != nil && *peer.Spec.PersistentKeepalive > 0 {
+			fmt.Fprintf(&b, "PersistentKeepalive = %d\n", *peer.Spec.PersistentKeepalive)
+		}
 	}
 
 	return b.String(), nil
