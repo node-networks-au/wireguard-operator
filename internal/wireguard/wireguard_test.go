@@ -170,3 +170,16 @@ func TestBuildWgQuickConfig_TrimsAllowedIPsWhitespace(t *testing.T) {
 		}
 	}
 }
+
+// TestWgSyncconfTempDir_IsWritableEmptyDirMount guards against a regression of
+// the Phase E follow-up bug: os.CreateTemp("", ...) defaults to $TMPDIR/`/tmp`,
+// but the agent container's securityContext sets readOnlyRootFilesystem: true,
+// so /tmp is read-only and every reconcile fails with "read-only file system".
+// The operator's deployment template mounts an emptyDir named `socket` at
+// /var/run/wireguard/, which is always writable. If anyone moves the temp
+// file off that path they must also add a writable mount.
+func TestWgSyncconfTempDir_IsWritableEmptyDirMount(t *testing.T) {
+	if wgSyncconfTempDir != "/var/run/wireguard" {
+		t.Errorf("wgSyncconfTempDir = %q, want %q (the operator's deployment template mounts an emptyDir at this path; changing it requires a matching volume change in internal/resources/deployment.go)", wgSyncconfTempDir, "/var/run/wireguard")
+	}
+}
