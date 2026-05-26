@@ -359,27 +359,43 @@ func gatewayIPFromPrefix(prefix netip.Prefix) (*net.IPNet, net.IP, error) {
 // how downstream LAN routes (e.g. `10.254.0.0/16` behind a road-warrior peer)
 // are advertised to the server. Whitespace between entries is normalised
 // because `wg syncconf` is strict about CSV form.
+//
+// Phase G appends `WireguardPeer.spec.routes` (IPv4) and `spec.routesV6` (IPv6)
+// to the resulting CSV. Routes is the declarative counterpart to the freeform
+// AllowedIPs CSV — ops can list downstream LAN CIDRs that this peer is
+// responsible for, and the operator will splice them into the [Peer].AllowedIPs
+// the server enforces. Empty/unset Routes preserves the Phase E/F output
+// verbatim (no trailing comma, no extra CIDRs).
 func peerAllowedIPs(peer v1alpha1.WireguardPeer) string {
+	var out []string
+
 	if peer.Spec.AllowedIPs != "" {
-		parts := strings.Split(peer.Spec.AllowedIPs, ",")
-		out := make([]string, 0, len(parts))
-		for _, p := range parts {
-			p = strings.TrimSpace(p)
-			if p != "" {
+		for _, p := range strings.Split(peer.Spec.AllowedIPs, ",") {
+			if p = strings.TrimSpace(p); p != "" {
 				out = append(out, p)
 			}
 		}
-		return strings.Join(out, ",")
+	} else {
+		if peer.Spec.Address != "" {
+			out = append(out, peer.Spec.Address+"/32")
+		}
+		if peer.Spec.AddressV6 != "" {
+			out = append(out, peer.Spec.AddressV6+"/128")
+		}
 	}
 
-	var defaults []string
-	if peer.Spec.Address != "" {
-		defaults = append(defaults, peer.Spec.Address+"/32")
+	for _, r := range peer.Spec.Routes {
+		if r = strings.TrimSpace(r); r != "" {
+			out = append(out, r)
+		}
 	}
-	if peer.Spec.AddressV6 != "" {
-		defaults = append(defaults, peer.Spec.AddressV6+"/128")
+	for _, r := range peer.Spec.RoutesV6 {
+		if r = strings.TrimSpace(r); r != "" {
+			out = append(out, r)
+		}
 	}
-	return strings.Join(defaults, ",")
+
+	return strings.Join(out, ",")
 }
 
 // BuildWgQuickConfig renders the agent's in-memory desired state to a wg-quick
