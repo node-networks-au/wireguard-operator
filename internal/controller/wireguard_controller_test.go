@@ -1288,6 +1288,140 @@ var _ = Describe("wireguard controller", func() {
 			}, Timeout, Interval).Should(BeEmpty())
 		})
 
+		It("reconciles agent --wg-listen-port when Spec.AgentListenPort changes", func() {
+			wgServer := &v1alpha1.Wireguard{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      wgKey.Name,
+					Namespace: wgKey.Namespace,
+				},
+				Spec: v1alpha1.WireguardSpec{
+					ServiceType: corev1.ServiceTypeClusterIP,
+					Address:     "test-address",
+				},
+			}
+			Expect(k8sClient.Create(context.Background(), wgServer)).Should(Succeed())
+
+			serviceKey := types.NamespacedName{
+				Namespace: wgKey.Namespace,
+				Name:      wgKey.Name + "-svc",
+			}
+			Eventually(func() error {
+				svc := &corev1.Service{}
+				return k8sClient.Get(context.Background(), serviceKey, svc)
+			}, Timeout, Interval).Should(Succeed())
+			Expect(reconcileServiceWithClusterIP(serviceKey, 51820)).Should(Succeed())
+
+			depKey := types.NamespacedName{
+				Namespace: wgKey.Namespace,
+				Name:      wgKey.Name + "-dep",
+			}
+
+			// Default: --wg-listen-port 51820
+			Eventually(func() string {
+				dep := &appsv1.Deployment{}
+				if err := k8sClient.Get(context.Background(), depKey, dep); err != nil {
+					return ""
+				}
+				for _, c := range dep.Spec.Template.Spec.Containers {
+					if c.Name == "agent" {
+						return strings.Join(c.Command, " ")
+					}
+				}
+				return ""
+			}, Timeout, Interval).Should(ContainSubstring("--wg-listen-port 51820"))
+
+			// Patch CR to set AgentListenPort=51821
+			Eventually(func() error {
+				wg := &v1alpha1.Wireguard{}
+				if err := k8sClient.Get(context.Background(), wgKey, wg); err != nil {
+					return err
+				}
+				p := int32(51821)
+				wg.Spec.AgentListenPort = &p
+				return k8sClient.Update(context.Background(), wg)
+			}, Timeout, Interval).Should(Succeed())
+
+			Eventually(func() string {
+				dep := &appsv1.Deployment{}
+				if err := k8sClient.Get(context.Background(), depKey, dep); err != nil {
+					return ""
+				}
+				for _, c := range dep.Spec.Template.Spec.Containers {
+					if c.Name == "agent" {
+						return strings.Join(c.Command, " ")
+					}
+				}
+				return ""
+			}, Timeout, Interval).Should(ContainSubstring("--wg-listen-port 51821"))
+		})
+
+		It("reconciles Deployment.Spec.Strategy when Spec.DeploymentStrategy is Recreate", func() {
+			wgServer := &v1alpha1.Wireguard{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      wgKey.Name,
+					Namespace: wgKey.Namespace,
+				},
+				Spec: v1alpha1.WireguardSpec{
+					ServiceType: corev1.ServiceTypeClusterIP,
+					Address:     "test-address",
+				},
+			}
+			Expect(k8sClient.Create(context.Background(), wgServer)).Should(Succeed())
+
+			serviceKey := types.NamespacedName{
+				Namespace: wgKey.Namespace,
+				Name:      wgKey.Name + "-svc",
+			}
+			Eventually(func() error {
+				svc := &corev1.Service{}
+				return k8sClient.Get(context.Background(), serviceKey, svc)
+			}, Timeout, Interval).Should(Succeed())
+			Expect(reconcileServiceWithClusterIP(serviceKey, 51820)).Should(Succeed())
+
+			depKey := types.NamespacedName{
+				Namespace: wgKey.Namespace,
+				Name:      wgKey.Name + "-dep",
+			}
+
+			// Default: RollingUpdate
+			Eventually(func() appsv1.DeploymentStrategyType {
+				dep := &appsv1.Deployment{}
+				if err := k8sClient.Get(context.Background(), depKey, dep); err != nil {
+					return ""
+				}
+				return dep.Spec.Strategy.Type
+			}, Timeout, Interval).Should(Equal(appsv1.RollingUpdateDeploymentStrategyType))
+
+			// Patch CR to set DeploymentStrategy=Recreate
+			Eventually(func() error {
+				wg := &v1alpha1.Wireguard{}
+				if err := k8sClient.Get(context.Background(), wgKey, wg); err != nil {
+					return err
+				}
+				wg.Spec.DeploymentStrategy = &appsv1.DeploymentStrategy{
+					Type: appsv1.RecreateDeploymentStrategyType,
+				}
+				return k8sClient.Update(context.Background(), wg)
+			}, Timeout, Interval).Should(Succeed())
+
+			Eventually(func() appsv1.DeploymentStrategyType {
+				dep := &appsv1.Deployment{}
+				if err := k8sClient.Get(context.Background(), depKey, dep); err != nil {
+					return ""
+				}
+				return dep.Spec.Strategy.Type
+			}, Timeout, Interval).Should(Equal(appsv1.RecreateDeploymentStrategyType))
+
+			// And RollingUpdate sub-block must be nil for Recreate (K8s API rule)
+			Eventually(func() *appsv1.RollingUpdateDeployment {
+				dep := &appsv1.Deployment{}
+				if err := k8sClient.Get(context.Background(), depKey, dep); err != nil {
+					return &appsv1.RollingUpdateDeployment{}
+				}
+				return dep.Spec.Strategy.RollingUpdate
+			}, Timeout, Interval).Should(BeNil())
+		})
+
 		It("rejects a peer with a duplicate address on the same wireguardRef", func() {
 			wgServer := &v1alpha1.Wireguard{
 				ObjectMeta: metav1.ObjectMeta{
