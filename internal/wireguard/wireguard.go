@@ -603,15 +603,15 @@ func BuildWgQuickConfig(state agent.State, listenPort int) (string, error) {
 
 		fmt.Fprintf(&b, "\n[Peer]\nPublicKey = %s\nAllowedIPs = %s\n", peer.Spec.PublicKey, allowed)
 
-		// PersistentKeepalive on the server-side [Peer] block is what makes the
-		// server emit keep-alives even when the application is idle; the OVN
-		// egress NAT's conntrack entries expire ~30s after the last packet in
-		// either direction, so the server must keep the flow alive or replies
-		// to peer-initiated traffic stop coming back. Backwards-compat: omit
-		// the line entirely when the field is unset.
-		if peer.Spec.PersistentKeepalive != nil && *peer.Spec.PersistentKeepalive > 0 {
-			fmt.Fprintf(&b, "PersistentKeepalive = %d\n", *peer.Spec.PersistentKeepalive)
-		}
+		// Intentionally NO PersistentKeepalive on the server-side [Peer] block:
+		// the server sits behind a stable LoadBalancer IP (not behind NAT), so
+		// it has no mapping to keep alive. The whole design is responder-only —
+		// peers initiate everything, the server only replies. PersistentKeepalive
+		// belongs on the PEER side (in the wg-quick blob handed to customer
+		// devices), where it keeps the peer's outbound NAT/conntrack mapping
+		// fresh. Setting it on the server makes the server emit unsolicited
+		// keepalive packets every N seconds once a peer has dialed in, which
+		// is "active" behavior we explicitly don't want.
 	}
 
 	return b.String(), nil

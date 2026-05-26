@@ -328,10 +328,12 @@ DNS = %s`, strings.TrimSpace(string(v)), addressLine, dnsConfiguration)
 				}
 				// PersistentKeepalive on the peer-side [Peer] block (which
 				// represents the SERVER) makes the customer's wg client ping
-				// the server every N seconds. Combined with the server-side
-				// PersistentKeepalive emitted by BuildWgQuickConfig, this
-				// keeps the OVN egress NAT's conntrack entry warm so replies
-				// destined for the peer don't get dropped after idle timeout.
+				// the server every N seconds. This is the useful direction:
+				// peers typically sit behind NAT, and the keepalive packets
+				// keep the peer's outbound NAT/conntrack mapping fresh so the
+				// server's replies still find a path back. The server itself
+				// does NOT emit PersistentKeepalive (see wireguard.go); it's
+				// strictly responder-only.
 				// Backwards-compat: emit nothing when the field is unset.
 				persistentKeepaliveLine := ""
 				if peer.Spec.PersistentKeepalive != nil && *peer.Spec.PersistentKeepalive > 0 {
