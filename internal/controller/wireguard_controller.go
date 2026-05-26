@@ -890,6 +890,56 @@ func (r *WireguardReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 	}
 
+	// Ensure agent --wg-listen-port matches Spec.AgentListenPort.
+	// NOTE: the package-level `port` const (51820) is shadowed earlier in this
+	// function by a string local; use the literal default here.
+	const defaultListenPort = int32(51820)
+	desiredListenPort := defaultListenPort
+	if wireguard.Spec.AgentListenPort != nil {
+		desiredListenPort = *wireguard.Spec.AgentListenPort
+	}
+	existingListenPort := defaultListenPort
+	for _, c := range deploymentFound.Spec.Template.Spec.Containers {
+		if c.Name == "agent" {
+			for i, tok := range c.Command {
+				if tok == "--wg-listen-port" && i+1 < len(c.Command) {
+					if v, perr := strconv.ParseInt(c.Command[i+1], 10, 32); perr == nil {
+						existingListenPort = int32(v)
+					}
+					break
+				}
+			}
+			break
+		}
+	}
+	if existingListenPort != desiredListenPort {
+		log.Info("Updating deployment agent listen port", "desired", desiredListenPort, "existing", existingListenPort)
+		dep := r.deploymentForWireguard(wireguard)
+		if err := r.Update(ctx, dep); err != nil {
+			log.Error(err, "unable to update deployment agent listen port", "dep.Namespace", dep.Namespace, "dep.Name", dep.Name)
+			return ctrl.Result{}, err
+		}
+	}
+
+	// Ensure Deployment.Spec.Strategy matches Spec.DeploymentStrategy.
+	desiredStrategy := appsv1.DeploymentStrategy{Type: appsv1.RollingUpdateDeploymentStrategyType}
+	if wireguard.Spec.DeploymentStrategy != nil {
+		desiredStrategy = *wireguard.Spec.DeploymentStrategy
+		if desiredStrategy.Type == appsv1.RecreateDeploymentStrategyType {
+			desiredStrategy.RollingUpdate = nil
+		}
+	}
+	// Only compare Type (RollingUpdate sub-block details are defaulted by the
+	// API server — comparing full structs causes ping-pong reconciles).
+	if deploymentFound.Spec.Strategy.Type != desiredStrategy.Type {
+		log.Info("Updating deployment strategy", "desired", desiredStrategy.Type, "existing", deploymentFound.Spec.Strategy.Type)
+		dep := r.deploymentForWireguard(wireguard)
+		if err := r.Update(ctx, dep); err != nil {
+			log.Error(err, "unable to update deployment strategy", "dep.Namespace", dep.Namespace, "dep.Name", dep.Name)
+			return ctrl.Result{}, err
+		}
+	}
+
 	// Update resource-level status and unique identifier if available
 	{
 		resourcesStatus := make([]v1alpha1.Resource, 0, 4)
@@ -1127,6 +1177,25 @@ func (r *WireguardReconciler) deploymentForWireguard(m *v1alpha1.Wireguard) *app
 	allowPrivilegeEscalation := false
 	automountServiceAccountToken := false
 
+	// Resolve effective WireGuard listen port. Spec.AgentListenPort overrides
+	// the default; only the --wg-listen-port flag changes. ContainerPort/Service
+	// remain on the default to preserve in-cluster routing assumptions.
+	listenPort := int32(port)
+	if m.Spec.AgentListenPort != nil {
+		listenPort = *m.Spec.AgentListenPort
+	}
+
+	// Resolve deployment strategy. Default to RollingUpdate. When the user
+	// requests Recreate, drop any RollingUpdate block (the K8s API rejects
+	// spec.strategy.rollingUpdate when type=Recreate).
+	strategy := appsv1.DeploymentStrategy{Type: appsv1.RollingUpdateDeploymentStrategyType}
+	if m.Spec.DeploymentStrategy != nil {
+		strategy = *m.Spec.DeploymentStrategy
+		if strategy.Type == appsv1.RecreateDeploymentStrategyType {
+			strategy.RollingUpdate = nil
+		}
+	}
+
 	dep := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      m.Name + "-dep",
@@ -1135,6 +1204,7 @@ func (r *WireguardReconciler) deploymentForWireguard(m *v1alpha1.Wireguard) *app
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: &replicas,
+			Strategy: strategy,
 			Selector: &metav1.LabelSelector{
 				MatchLabels: ls,
 			},
@@ -1179,7 +1249,7 @@ func (r *WireguardReconciler) deploymentForWireguard(m *v1alpha1.Wireguard) *app
 							Image:           r.AgentImage,
 							ImagePullPolicy: r.AgentImagePullPolicy,
 							Name:            "agent",
-							Command:         []string{"agent", "--v", "11", "--wg-iface", "wg0", "--wg-listen-port", fmt.Sprintf("%d", port), "--state", "/tmp/wireguard/state.json", "--wg-userspace-implementation-fallback", "wireguard-go"},
+							Command:         []string{"agent", "--v", "11", "--wg-iface", "wg0", "--wg-listen-port", fmt.Sprintf("%d", listenPort), "--state", "/tmp/wireguard/state.json", "--wg-userspace-implementation-fallback", "wireguard-go"},
 							Ports: []corev1.ContainerPort{
 								{
 									ContainerPort: port,
