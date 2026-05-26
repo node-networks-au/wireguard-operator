@@ -296,6 +296,109 @@ func TestBuildWgQuickConfig_TrimsAllowedIPsWhitespace(t *testing.T) {
 	}
 }
 
+// TestDesiredKernelRoutes_CollectsRoutesAndRoutesV6 locks down Phase G follow-up:
+// the netlink route-install loop reads from a pure function that returns the
+// union of every enabled peer's Routes + RoutesV6 (deduped). Disabled peers,
+// empty-PublicKey peers, and blank/whitespace entries must be filtered. The
+// resulting list is what the agent will pass to `netlink.RouteReplace` for
+// dev wg0.
+func TestDesiredKernelRoutes_CollectsRoutesAndRoutesV6(t *testing.T) {
+	peers := []v1alpha1.WireguardPeer{
+		{
+			Spec: v1alpha1.WireguardPeerSpec{
+				PublicKey: validPeerPublicKey,
+				Address:   "172.31.255.11",
+				Routes:    []string{"10.254.11.0/24", "192.168.42.0/24"},
+				RoutesV6:  []string{"fd00:42::/48"},
+			},
+		},
+		{
+			Spec: v1alpha1.WireguardPeerSpec{
+				PublicKey: validPeerPublicKey2,
+				Address:   "172.31.255.12",
+				// no Routes
+			},
+		},
+	}
+
+	got := desiredKernelRoutes(peers)
+	want := []string{"10.254.11.0/24", "192.168.42.0/24", "fd00:42::/48"}
+	if len(got) != len(want) {
+		t.Fatalf("desiredKernelRoutes len = %d (%v), want %d (%v)", len(got), got, len(want), want)
+	}
+	gotSet := map[string]bool{}
+	for _, c := range got {
+		gotSet[c] = true
+	}
+	for _, w := range want {
+		if !gotSet[w] {
+			t.Errorf("desiredKernelRoutes missing %q (got %v)", w, got)
+		}
+	}
+}
+
+// TestDesiredKernelRoutes_SkipsDisabledAndEmptyKeyPeers asserts the same
+// filtering invariants peerAllowedIPs honours: a Disabled peer must NOT
+// contribute its Routes (otherwise the kernel keeps routing to a tunnel
+// the wg config no longer carries), and a PublicKey-less peer must NOT
+// contribute either (it can't actually receive packets).
+func TestDesiredKernelRoutes_SkipsDisabledAndEmptyKeyPeers(t *testing.T) {
+	peers := []v1alpha1.WireguardPeer{
+		{Spec: v1alpha1.WireguardPeerSpec{PublicKey: validPeerPublicKey, Address: "10.0.0.1", Disabled: true, Routes: []string{"10.10.0.0/24"}}},
+		{Spec: v1alpha1.WireguardPeerSpec{PublicKey: "", Address: "10.0.0.2", Routes: []string{"10.20.0.0/24"}}},
+		{Spec: v1alpha1.WireguardPeerSpec{PublicKey: validPeerPublicKey2, Address: "10.0.0.3", Routes: []string{"10.30.0.0/24"}}},
+	}
+
+	got := desiredKernelRoutes(peers)
+	if len(got) != 1 || got[0] != "10.30.0.0/24" {
+		t.Errorf("desiredKernelRoutes filtered set = %v, want [10.30.0.0/24]", got)
+	}
+}
+
+// TestDesiredKernelRoutes_TrimsWhitespaceAndSkipsEmpty guards against ops
+// pasting CSVs into the per-string Routes slice with trailing whitespace.
+// Empty entries (post-trim) must be dropped — netlink would reject them.
+func TestDesiredKernelRoutes_TrimsWhitespaceAndSkipsEmpty(t *testing.T) {
+	peers := []v1alpha1.WireguardPeer{
+		{
+			Spec: v1alpha1.WireguardPeerSpec{
+				PublicKey: validPeerPublicKey,
+				Address:   "10.0.0.1",
+				Routes:    []string{" 10.10.0.0/24 ", "", "  "},
+				RoutesV6:  []string{" fd00::/64 "},
+			},
+		},
+	}
+
+	got := desiredKernelRoutes(peers)
+	wantSet := map[string]bool{"10.10.0.0/24": true, "fd00::/64": true}
+	if len(got) != 2 {
+		t.Fatalf("desiredKernelRoutes len = %d (%v), want 2", len(got), got)
+	}
+	for _, c := range got {
+		if !wantSet[c] {
+			t.Errorf("unexpected entry %q in %v", c, got)
+		}
+	}
+}
+
+// TestDesiredKernelRoutes_Dedupes guards against the case where two peers
+// declare overlapping Routes (operator misconfig, or one peer carries a
+// /24 the other carries a /25 of the same prefix — they'd both end up
+// trying to claim the same kernel route, and we don't want a hot loop
+// of RouteReplace calls).
+func TestDesiredKernelRoutes_Dedupes(t *testing.T) {
+	peers := []v1alpha1.WireguardPeer{
+		{Spec: v1alpha1.WireguardPeerSpec{PublicKey: validPeerPublicKey, Address: "10.0.0.1", Routes: []string{"10.10.0.0/24"}}},
+		{Spec: v1alpha1.WireguardPeerSpec{PublicKey: validPeerPublicKey2, Address: "10.0.0.2", Routes: []string{"10.10.0.0/24"}}},
+	}
+
+	got := desiredKernelRoutes(peers)
+	if len(got) != 1 || got[0] != "10.10.0.0/24" {
+		t.Errorf("desiredKernelRoutes dedup = %v, want [10.10.0.0/24]", got)
+	}
+}
+
 // TestWgSyncconfTempDir_IsWritableEmptyDirMount guards against a regression of
 // the Phase E follow-up bug: os.CreateTemp("", ...) defaults to $TMPDIR/`/tmp`,
 // but the agent container's securityContext sets readOnlyRootFilesystem: true,
