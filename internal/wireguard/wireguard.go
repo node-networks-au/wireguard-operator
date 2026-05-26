@@ -322,6 +322,170 @@ func (wg *Wireguard) Sync(state agent.State) error {
 		return err
 	}
 
+	// Phase G follow-up: install kernel routes for each peer's downstream
+	// CIDRs (Spec.Routes / Spec.RoutesV6). Without this, the wg pod's
+	// routing table doesn't direct cluster-originated traffic (e.g. a
+	// poller hitting a downstream LAN) into wg0 — packets fall through to
+	// eth0 and the underlying subnet gateway ICMP-redirects them. We
+	// log-and-continue on errors so a single bad CIDR doesn't block the
+	// rest of the reconcile (wg syncconf already succeeded).
+	if err := syncPeerRoutes(wg.Iface, state, wg.Logger); err != nil {
+		wg.Logger.Error(err, "failed to sync peer routes")
+	}
+
+	return nil
+}
+
+// desiredKernelRoutes returns the deduplicated, whitespace-trimmed union of
+// every enabled peer's Spec.Routes + Spec.RoutesV6. This is the set of CIDRs
+// the agent should install as kernel routes pointing at wg0, so traffic
+// originating in the cluster (e.g. a poller pod hitting a downstream LAN
+// behind a road-warrior peer) gets delivered into the tunnel rather than
+// falling through to eth0 and getting ICMP-redirected by the underlying
+// subnet gateway.
+//
+// Filtering matches peerAllowedIPs / BuildWgQuickConfig: a Disabled or
+// PublicKey-less peer can't actually carry packets, so its declared routes
+// must not appear in the kernel routing table either. This is a pure
+// function so it can be unit-tested without root or netlink.
+func desiredKernelRoutes(peers []v1alpha1.WireguardPeer) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, peer := range peers {
+		if peer.Spec.Disabled {
+			continue
+		}
+		if peer.Spec.PublicKey == "" {
+			continue
+		}
+		for _, r := range peer.Spec.Routes {
+			r = strings.TrimSpace(r)
+			if r == "" || seen[r] {
+				continue
+			}
+			seen[r] = true
+			out = append(out, r)
+		}
+		for _, r := range peer.Spec.RoutesV6 {
+			r = strings.TrimSpace(r)
+			if r == "" || seen[r] {
+				continue
+			}
+			seen[r] = true
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// syncPeerRoutes installs the per-peer downstream CIDRs returned by
+// desiredKernelRoutes as kernel routes on `iface` (wg0), and prunes any
+// stale routes the agent itself previously installed but that are no
+// longer desired.
+//
+// We use netlink.RouteReplace (idempotent — adds if missing, updates if
+// present) so re-asserting the desired state every reconcile is cheap
+// and tolerates manual `ip route del` interference between reconciles.
+//
+// Stale-route cleanup is scoped tightly: we only remove routes whose
+// Dst CIDR matches the existing "we previously installed" criteria,
+// which we approximate by:
+//   - LinkIndex == wg0
+//   - Dst != nil
+//   - Dst != the server's own PeerCIDR / PeerCIDRv6 (managed by syncRoute)
+//
+// Anything else on wg0 (notably the per-peer /32 + /128 routes wg syncconf
+// installs automatically from AllowedIPs) is left alone — those have Dst
+// of /32 or /128, which we don't generate from Routes (which are CIDR
+// blocks, not host addresses).
+//
+// Errors on individual route operations are logged and the function
+// continues — a single peer's bad CIDR shouldn't block the whole reconcile.
+func syncPeerRoutes(iface string, state agent.State, logger logr.Logger) error {
+	link, err := netlink.LinkByName(iface)
+	if err != nil {
+		return fmt.Errorf("failed to get link %s: %w", iface, err)
+	}
+
+	desired := desiredKernelRoutes(state.Peers)
+	desiredSet := map[string]bool{}
+	for _, c := range desired {
+		desiredSet[c] = true
+	}
+
+	// Determine server-managed CIDRs to exclude from stale cleanup.
+	excluded := map[string]bool{}
+	if cidr := state.Server.Spec.PeerCIDR; cidr != "" {
+		if _, n, err := net.ParseCIDR(cidr); err == nil {
+			excluded[n.String()] = true
+		}
+	} else {
+		// Default PeerCIDR4 path syncRoute also installs.
+		if _, n, err := net.ParseCIDR(ipam.DefaultPeerCIDR4); err == nil {
+			excluded[n.String()] = true
+		}
+	}
+	if cidr := state.Server.Spec.PeerCIDRv6; cidr != "" {
+		if _, n, err := net.ParseCIDR(cidr); err == nil {
+			excluded[n.String()] = true
+		}
+	}
+
+	// Install / re-assert desired routes.
+	for _, cidr := range desired {
+		_, dst, err := net.ParseCIDR(cidr)
+		if err != nil {
+			logger.Error(err, "skipping invalid CIDR in peer Routes", "cidr", cidr)
+			continue
+		}
+		// No Gw + no Src + LinkIndex set => kernel auto-applies scope link,
+		// which is exactly what `ip route add <cidr> dev wg0` produces. We
+		// intentionally don't set Scope explicitly so the code compiles on
+		// non-Linux (the netlink.SCOPE_* constants live in _linux.go).
+		route := netlink.Route{
+			LinkIndex: link.Attrs().Index,
+			Dst:       dst,
+		}
+		if err := netlink.RouteReplace(&route); err != nil {
+			logger.Error(err, "failed to install peer route", "cidr", cidr, "iface", iface)
+			continue
+		}
+		logger.V(2).Info("peer route installed", "cidr", cidr, "iface", iface)
+	}
+
+	// Prune stale routes: anything on wg0 with a Dst that isn't in the desired
+	// set and isn't a server-managed CIDR and isn't a host route (/32 or /128,
+	// which `wg syncconf` synthesises from AllowedIPs).
+	// syscall.AF_UNSPEC (== 0) means "all families" — same value as
+	// netlink.FAMILY_ALL, but available cross-platform so the package still
+	// compiles on darwin for local dev. The agent only ever runs on Linux.
+	existing, err := netlink.RouteList(link, syscall.AF_UNSPEC)
+	if err != nil {
+		return fmt.Errorf("failed to list routes on %s: %w", iface, err)
+	}
+	for _, r := range existing {
+		if r.LinkIndex != link.Attrs().Index || r.Dst == nil {
+			continue
+		}
+		dstStr := r.Dst.String()
+		if desiredSet[dstStr] {
+			continue
+		}
+		if excluded[dstStr] {
+			continue
+		}
+		// Skip host routes — wg syncconf-synthesised AllowedIPs entries.
+		ones, bits := r.Dst.Mask.Size()
+		if (bits == 32 && ones == 32) || (bits == 128 && ones == 128) {
+			continue
+		}
+		if err := netlink.RouteDel(&r); err != nil {
+			logger.Error(err, "failed to remove stale peer route", "cidr", dstStr, "iface", iface)
+			continue
+		}
+		logger.V(2).Info("stale peer route removed", "cidr", dstStr, "iface", iface)
+	}
+
 	return nil
 }
 
