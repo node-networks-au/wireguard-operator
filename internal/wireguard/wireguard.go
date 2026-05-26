@@ -22,6 +22,16 @@ import (
 
 const MTU = 1420
 
+// wgSyncconfTempDir is the directory used for the short-lived wg-syncconf
+// config file. The agent container runs with `securityContext.readOnlyRootFilesystem: true`
+// (set by the operator's own deployment template in internal/resources/deployment.go),
+// so `/tmp` (the default for os.CreateTemp) is read-only and writes fail with
+// `read-only file system`. The operator's deployment template mounts an
+// emptyDir named `socket` at `/var/run/wireguard/` (used for the wg control
+// socket), which is always writable; reusing that mount keeps the fix
+// self-contained without adding a new volume.
+const wgSyncconfTempDir = "/var/run/wireguard"
+
 func syncRoute(iface string, cidr string, gw net.IP, family int) error {
 	link, err := netlink.LinkByName(iface)
 	if err != nil {
@@ -212,7 +222,7 @@ func (wg *Wireguard) syncWireguard(state agent.State, iface string, listenPort i
 	// Write to a temp file rather than /dev/stdin: `wg syncconf` accepts a
 	// path argument; piping stdin works on Linux but is less portable and
 	// makes error messages harder to interpret in agent logs.
-	tmp, err := os.CreateTemp("", "wg-syncconf-*.conf")
+	tmp, err := os.CreateTemp(wgSyncconfTempDir, "wg-syncconf-*.conf")
 	if err != nil {
 		return fmt.Errorf("create wg syncconf temp file: %w", err)
 	}
