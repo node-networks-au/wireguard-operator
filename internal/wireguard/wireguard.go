@@ -1,11 +1,13 @@
 package wireguard
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/netip"
 	"os"
 	"os/exec"
+	"strings"
 	"syscall"
 	"time"
 
@@ -16,8 +18,6 @@ import (
 	"github.com/nccloud/wireguard-operator/internal/ipam"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
-	"golang.zx2c4.com/wireguard/wgctrl"
-	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
 const MTU = 1420
@@ -196,28 +196,44 @@ func SyncLink(_ agent.State, iface string, wgUserspaceImplementationFallback str
 	return nil
 }
 
+// syncWireguard renders a wg-quick formatted config from `state` and applies
+// it by shelling out to `wg syncconf <iface> <tmpfile>`. Phase E replaces the
+// previous wgctrl-go `ConfigureDevice` call to fix the multi-CIDR AllowedIPs
+// truncation bug: wgctrl's PeerConfig was built with only `<addr>/32`, and
+// `ReplaceAllowedIPs=true` made every ~30s reconcile clobber the broader CIDRs
+// ops added via `WireguardPeer.spec.allowedIPs`. `wg syncconf` honours the
+// supplied AllowedIPs CSV verbatim and only diffs peers that actually changed.
 func (wg *Wireguard) syncWireguard(state agent.State, iface string, listenPort int) error {
-	c, _ := wgctrl.New()
-	cfg, err := CreateWireguardConfiguration(state, iface, listenPort)
+	cfg, err := BuildWgQuickConfig(state, listenPort)
 	if err != nil {
 		return err
 	}
 
-	err = c.ConfigureDevice(iface, cfg)
+	// Write to a temp file rather than /dev/stdin: `wg syncconf` accepts a
+	// path argument; piping stdin works on Linux but is less portable and
+	// makes error messages harder to interpret in agent logs.
+	tmp, err := os.CreateTemp("", "wg-syncconf-*.conf")
 	if err != nil {
-		return err
+		return fmt.Errorf("create wg syncconf temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+
+	if _, err := tmp.WriteString(cfg); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write wg syncconf temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close wg syncconf temp file: %w", err)
 	}
 
-	for _, peer := range cfg.Peers {
-		if peer.Remove {
-			wg.Logger.V(2).Info("Removed peer", "peerIP", peer.AllowedIPs[0].String(), "peerPublicKey", peer.PublicKey.String())
-		} else if peer.UpdateOnly {
-			wg.Logger.V(2).Info("Updated peer", "peerIP", peer.AllowedIPs[0].String(), "peerPublicKey", peer.PublicKey.String())
-		} else {
-			wg.Logger.V(2).Info("Added peer", "peerIP", peer.AllowedIPs[0].String(), "peerPublicKey", peer.PublicKey.String())
-		}
+	cmd := exec.CommandContext(context.Background(), "wg", "syncconf", iface, tmpPath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("wg syncconf %s failed: %w (output: %s)", iface, err, strings.TrimSpace(string(output)))
 	}
 
+	wg.Logger.V(2).Info("wg syncconf applied", "iface", iface, "peers", len(state.Peers))
 	return nil
 }
 
@@ -299,12 +315,6 @@ func (wg *Wireguard) Sync(state agent.State) error {
 	return nil
 }
 
-func getIP(ip string) []net.IPNet {
-	_, ipnet, _ := net.ParseCIDR(ip)
-
-	return []net.IPNet{*ipnet}
-}
-
 func gatewayIPFromPrefix(prefix netip.Prefix) (*net.IPNet, net.IP, error) {
 	prefix = prefix.Masked()
 	addr := prefix.Addr()
@@ -333,83 +343,58 @@ func gatewayIPFromPrefix(prefix netip.Prefix) (*net.IPNet, net.IP, error) {
 	}
 }
 
-func createPeersConfiguration(state agent.State, iface string) ([]wgtypes.PeerConfig, error) {
-	var peersState = make(map[string]v1alpha1.WireguardPeer)
-	for _, peer := range state.Peers {
-		peersState[peer.Spec.PublicKey] = peer
-	}
-
-	c, err := wgctrl.New()
-
-	if err != nil {
-		return []wgtypes.PeerConfig{}, err
-	}
-
-	device, err := c.Device(iface)
-
-	if err != nil {
-		return []wgtypes.PeerConfig{}, err
-	}
-
-	var peerConfigurationByPublicKey = make(map[string]wgtypes.PeerConfig)
-	var existingConfgiuredPeersByPublicKey = make(map[string]bool)
-
-	for _, peer := range device.Peers {
-
-		existingConfgiuredPeersByPublicKey[peer.PublicKey.String()] = true
-
-		peerState, ok := peersState[peer.PublicKey.String()]
-		if !ok {
-			// delete peer
-			p := wgtypes.PeerConfig{
-				Remove:     true,
-				AllowedIPs: peer.AllowedIPs,
-				PublicKey:  peer.PublicKey,
-			}
-			peerConfigurationByPublicKey[p.PublicKey.String()] = p
-
-		} else {
-			if peerState.Spec.Disabled || peerState.Spec.PublicKey == "" {
-				// delete peer
-				p := wgtypes.PeerConfig{
-					Remove:     true,
-					AllowedIPs: peer.AllowedIPs,
-					PublicKey:  peer.PublicKey,
-				}
-				peerConfigurationByPublicKey[p.PublicKey.String()] = p
-			} else {
-				var desiredAllowed []net.IPNet
-				if peerState.Spec.Address != "" {
-					desiredAllowed = append(desiredAllowed, getIP(peerState.Spec.Address+"/32")...)
-				}
-				if peerState.Spec.AddressV6 != "" {
-					desiredAllowed = append(desiredAllowed, getIP(peerState.Spec.AddressV6+"/128")...)
-				}
-
-				// Only update if AllowedIPs differ.
-				same := len(desiredAllowed) == len(peer.AllowedIPs)
-				if same {
-					for i := range desiredAllowed {
-						if !desiredAllowed[i].IP.Equal(peer.AllowedIPs[i].IP) || desiredAllowed[i].Mask.String() != peer.AllowedIPs[i].Mask.String() {
-							same = false
-							break
-						}
-					}
-				}
-				if !same {
-					p := wgtypes.PeerConfig{
-						UpdateOnly:        true,
-						AllowedIPs:        desiredAllowed,
-						PublicKey:         peer.PublicKey,
-						ReplaceAllowedIPs: true,
-					}
-					peerConfigurationByPublicKey[p.PublicKey.String()] = p
-				}
+// peerAllowedIPs returns the AllowedIPs CSV that should land in the [Peer]
+// section. Operators can override the default `<addr>/32[,<addrV6>/128]` by
+// setting `WireguardPeer.spec.allowedIPs` to a comma-separated list — this is
+// how downstream LAN routes (e.g. `10.254.0.0/16` behind a road-warrior peer)
+// are advertised to the server. Whitespace between entries is normalised
+// because `wg syncconf` is strict about CSV form.
+func peerAllowedIPs(peer v1alpha1.WireguardPeer) string {
+	if peer.Spec.AllowedIPs != "" {
+		parts := strings.Split(peer.Spec.AllowedIPs, ",")
+		out := make([]string, 0, len(parts))
+		for _, p := range parts {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				out = append(out, p)
 			}
 		}
+		return strings.Join(out, ",")
 	}
 
-	// add new peers
+	var defaults []string
+	if peer.Spec.Address != "" {
+		defaults = append(defaults, peer.Spec.Address+"/32")
+	}
+	if peer.Spec.AddressV6 != "" {
+		defaults = append(defaults, peer.Spec.AddressV6+"/128")
+	}
+	return strings.Join(defaults, ",")
+}
+
+// BuildWgQuickConfig renders the agent's in-memory desired state to a wg-quick
+// formatted config string suitable for `wg syncconf`. It is intentionally a
+// pure function (no netlink, no wgctrl) so it can be unit-tested without root,
+// without /dev/net/tun, and without an existing wg0 interface.
+//
+// The returned config contains a single [Interface] section (PrivateKey +
+// ListenPort) and one [Peer] section per enabled peer with a PublicKey and at
+// least one address. Disabled peers, peers without a PublicKey, and peers
+// without any Address/AddressV6 are skipped — this preserves the filtering
+// invariants the old wgctrl path enforced.
+//
+// `wg syncconf` reads [Interface].PrivateKey + ListenPort and applies the
+// [Peer] list as a diff: peers absent from the config are removed, peers
+// present are added/updated with their exact AllowedIPs CSV. This eliminates
+// the multi-CIDR truncation bug that Phase E fixes.
+func BuildWgQuickConfig(state agent.State, listenPort int) (string, error) {
+	if state.ServerPrivateKey == "" {
+		return "", fmt.Errorf("server private key is empty")
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "[Interface]\nPrivateKey = %s\nListenPort = %d\n", state.ServerPrivateKey, listenPort)
+
 	for _, peer := range state.Peers {
 		if peer.Spec.Disabled {
 			continue
@@ -417,63 +402,17 @@ func createPeersConfiguration(state agent.State, iface string) ([]wgtypes.PeerCo
 		if peer.Spec.PublicKey == "" {
 			continue
 		}
-
 		if peer.Spec.Address == "" && peer.Spec.AddressV6 == "" {
 			continue
 		}
-		key, err := wgtypes.ParseKey(peer.Spec.PublicKey)
-		if err != nil {
-			return []wgtypes.PeerConfig{}, err
-		}
 
-		_, ok := existingConfgiuredPeersByPublicKey[key.String()]
-		if ok {
+		allowed := peerAllowedIPs(peer)
+		if allowed == "" {
 			continue
 		}
 
-		// create peer
-		var allowed []net.IPNet
-		if peer.Spec.Address != "" {
-			allowed = append(allowed, getIP(peer.Spec.Address+"/32")...)
-		}
-		if peer.Spec.AddressV6 != "" {
-			allowed = append(allowed, getIP(peer.Spec.AddressV6+"/128")...)
-		}
-		p := wgtypes.PeerConfig{
-			AllowedIPs: allowed,
-			PublicKey:  key,
-		}
-		peerConfigurationByPublicKey[p.PublicKey.String()] = p
+		fmt.Fprintf(&b, "\n[Peer]\nPublicKey = %s\nAllowedIPs = %s\n", peer.Spec.PublicKey, allowed)
 	}
 
-	l := make([]wgtypes.PeerConfig, 0, len(peerConfigurationByPublicKey))
-
-	for _, value := range peerConfigurationByPublicKey {
-		l = append(l, value)
-	}
-
-	return l, nil
-}
-
-func CreateWireguardConfiguration(state agent.State, iface string, listenPort int) (wgtypes.Config, error) {
-	cfg := wgtypes.Config{}
-
-	key, err := wgtypes.ParseKey(state.ServerPrivateKey)
-	if err != nil {
-		return wgtypes.Config{}, err
-	}
-	cfg.PrivateKey = &key
-
-	// make sure we do not interrupt existing sessions
-	cfg.ReplacePeers = false
-	cfg.ListenPort = &listenPort
-
-	peers, err := createPeersConfiguration(state, iface)
-	if err != nil {
-		return wgtypes.Config{}, err
-	}
-
-	cfg.Peers = peers
-
-	return cfg, nil
+	return b.String(), nil
 }
