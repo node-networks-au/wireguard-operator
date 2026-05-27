@@ -119,26 +119,56 @@ func (r *WireguardPeerReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	if peer.Spec.PublicKey == "" {
-		privateKey := key.String()
-		publicKey := key.PublicKey().String()
+		secretName := types.NamespacedName{Name: peer.Name + "-peer", Namespace: peer.Namespace}
 
-		secret := r.secretForPeer(peer, privateKey, publicKey)
+		var privateKey, publicKey string
 
-		log.Info("Creating a new secret", "secret.Namespace", secret.Namespace, "secret.Name", secret.Name)
-		err = r.Create(ctx, secret)
-		if err != nil {
-			log.Error(err, "Failed to create new secret", "secret.Namespace", secret.Namespace, "secret.Name", secret.Name)
-			return ctrl.Result{}, err
+		// Try to adopt an existing <peer>-peer Secret first. This is the
+		// path hit when ops pre-clone a peer keypair (e.g. for tenant
+		// migrations or 1Password-backed key sharing): the Secret exists
+		// before the WireguardPeer CR is reconciled. Without this, the
+		// reconciler errored with `secrets "<peer>-peer" already exists`
+		// at the r.Create call below and never populated
+		// spec.publicKey/spec.privateKeyRef on the CR, so wg0 never got
+		// the [Peer] block for this peer.
+		existing := &corev1.Secret{}
+		getErr := r.Get(ctx, secretName, existing)
+		switch {
+		case getErr == nil:
+			privateKey = string(existing.Data["privateKey"])
+			parsed, parseErr := wgtypes.ParseKey(privateKey)
+			if parseErr != nil {
+				log.Error(parseErr, "Failed to parse existing privateKey", "secret.Namespace", secretName.Namespace, "secret.Name", secretName.Name)
+				return ctrl.Result{}, fmt.Errorf("parse existing privateKey for %s: %w", secretName.Name, parseErr)
+			}
+			publicKey = parsed.PublicKey().String()
+			log.Info("Adopting existing peer secret", "secret.Namespace", secretName.Namespace, "secret.Name", secretName.Name)
+		case errors.IsNotFound(getErr):
+			privateKey = key.String()
+			publicKey = key.PublicKey().String()
+
+			secret := r.secretForPeer(peer, privateKey, publicKey)
+
+			log.Info("Creating a new secret", "secret.Namespace", secret.Namespace, "secret.Name", secret.Name)
+			if err := r.Create(ctx, secret); err != nil {
+				log.Error(err, "Failed to create new secret", "secret.Namespace", secret.Namespace, "secret.Name", secret.Name)
+				return ctrl.Result{}, err
+			}
+		default:
+			log.Error(getErr, "Failed to get peer secret", "secret.Namespace", secretName.Namespace, "secret.Name", secretName.Name)
+			return ctrl.Result{}, fmt.Errorf("get peer secret %s: %w", secretName.Name, getErr)
 		}
 
+		// Patch (not Update) the CR so we don't clobber field-manager
+		// ownership of unrelated fields (labels, annotations, status, etc.
+		// — KRO and other controllers may own those).
+		patch := client.MergeFrom(peer.DeepCopy())
 		newPeer.Spec.PublicKey = publicKey
 		newPeer.Spec.PrivateKey = v1alpha1.PrivateKey{
-			SecretKeyRef: corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: peer.Name + "-peer"}, Key: "privateKey"}}
-		err = r.Update(ctx, newPeer)
-
-		if err != nil {
-			log.Error(err, "Failed to create new peer", "secret.Namespace", secret.Namespace, "secret.Name", secret.Name)
-			return ctrl.Result{}, err
+			SecretKeyRef: corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: secretName.Name}, Key: "privateKey"}}
+		if err := r.Patch(ctx, newPeer, patch); err != nil {
+			log.Error(err, "Failed to patch peer with public key + secret ref", "secret.Namespace", secretName.Namespace, "secret.Name", secretName.Name)
+			return ctrl.Result{}, fmt.Errorf("patch WireguardPeer with public key + secret ref: %w", err)
 		}
 
 		return ctrl.Result{Requeue: true}, nil
