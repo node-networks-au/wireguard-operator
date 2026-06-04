@@ -492,31 +492,54 @@ func (r *WireguardReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			continue
 		}
 
-		// Resolve the peer's public key before the skip check below. Precedence:
-		//   1. spec.publicKey literal (set directly on the CR)
-		//   2. spec.publicKeyRef -> Secret key (external peer; key material held
-		//      outside the cluster, e.g. 1Password via an ExternalSecret)
-		//   3. derived from the private key (spec.privateKeyRef) when we hold it
-		// This lets a peer be declared with ONLY a public key (we never see its
-		// private key — the migrated-customer case) OR with only a private key
-		// (we hold it; the public key is computed). Mirrors the PSK resolution.
-		if peer.Spec.PublicKey == "" && peer.Spec.PublicKeyRef.SecretKeyRef.Name != "" {
+		// Resolve & validate the peer's public key before the skip check below.
+		// Precedence: spec.publicKey literal, then publicKeyRef -> Secret key
+		// (external peer whose key material lives outside the cluster, e.g.
+		// 1Password via an ExternalSecret), then derived from the private key
+		// (privateKeyRef) when we hold it. This lets a peer be declared with
+		// ONLY a public key (we never see its private key — the migrated-
+		// customer case) OR with only a private key (we hold it; the public key
+		// is computed).
+		//
+		// FAIL CLOSED: if BOTH a private key and an explicit public key are
+		// present, they MUST match (the public key must be the curve25519
+		// derivation of the private key). On mismatch we mark the peer Error
+		// and refuse to install it into the server config — a swapped/typo'd
+		// key never silently takes effect.
+		specifiedPub := peer.Spec.PublicKey
+		if specifiedPub == "" && peer.Spec.PublicKeyRef.SecretKeyRef.Name != "" {
 			pubSecret := &corev1.Secret{}
 			if err := r.Get(ctx, types.NamespacedName{Name: peer.Spec.PublicKeyRef.SecretKeyRef.Name, Namespace: peer.Namespace}, pubSecret); err == nil {
 				if v, ok := pubSecret.Data[peer.Spec.PublicKeyRef.SecretKeyRef.Key]; ok {
-					peer.Spec.PublicKey = strings.TrimSpace(string(v))
+					specifiedPub = strings.TrimSpace(string(v))
 				}
 			}
 		}
-		if peer.Spec.PublicKey == "" && peer.Spec.PrivateKey.SecretKeyRef.Name != "" {
+		var derivedPub string
+		if peer.Spec.PrivateKey.SecretKeyRef.Name != "" {
 			privSecret := &corev1.Secret{}
 			if err := r.Get(ctx, types.NamespacedName{Name: peer.Spec.PrivateKey.SecretKeyRef.Name, Namespace: peer.Namespace}, privSecret); err == nil {
 				if v, ok := privSecret.Data[peer.Spec.PrivateKey.SecretKeyRef.Key]; ok {
 					if k, perr := wgtypes.ParseKey(strings.TrimSpace(string(v))); perr == nil {
-						peer.Spec.PublicKey = k.PublicKey().String()
+						derivedPub = k.PublicKey().String()
 					}
 				}
 			}
+		}
+		if specifiedPub != "" && derivedPub != "" && specifiedPub != derivedPub {
+			msg := fmt.Sprintf("public key %s does not match the key %s derived from the configured private key; refusing to install peer", specifiedPub, derivedPub)
+			log.Error(fmt.Errorf("peer public/private key mismatch"), msg, "peer", peer.Name)
+			peer.Status.Status = v1alpha1.Error
+			peer.Status.Message = msg
+			if err := r.Status().Update(ctx, &peer); err != nil {
+				log.Error(err, "Failed to update peer status after key mismatch", "peer", peer.Name)
+			}
+			continue
+		}
+		if specifiedPub != "" {
+			peer.Spec.PublicKey = specifiedPub
+		} else if derivedPub != "" {
+			peer.Spec.PublicKey = derivedPub
 		}
 
 		if peer.Spec.PublicKey == "" {
@@ -748,6 +771,26 @@ func (r *WireguardReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	// secret already created
 	if err == nil {
 		privateKey := string(secret.Data["privateKey"])
+
+		// FAIL CLOSED on a corrupt/mismatched server keypair: if the stored
+		// public key is not the curve25519 derivation of the stored private
+		// key, refuse to reconcile. A wrong server public key would be handed
+		// to every peer's wg-quick config and silently break all handshakes.
+		if storedPub := strings.TrimSpace(string(secret.Data["publicKey"])); storedPub != "" {
+			k, perr := wgtypes.ParseKey(strings.TrimSpace(privateKey))
+			if perr != nil {
+				msg := fmt.Sprintf("stored server private key is not a valid WireGuard key: %v", perr)
+				log.Error(perr, msg)
+				_ = r.updateStatus(ctx, req, metav1.Condition{Type: ConditionDegraded, Status: metav1.ConditionTrue, Reason: "ServerKeyInvalid", Message: msg})
+				return ctrl.Result{}, fmt.Errorf("%s", msg)
+			}
+			if derived := k.PublicKey().String(); derived != storedPub {
+				msg := fmt.Sprintf("server public key %s does not match the key %s derived from the stored private key; refusing to reconcile", storedPub, derived)
+				log.Error(fmt.Errorf("server public/private key mismatch"), msg)
+				_ = r.updateStatus(ctx, req, metav1.Condition{Type: ConditionDegraded, Status: metav1.ConditionTrue, Reason: "ServerKeyMismatch", Message: msg})
+				return ctrl.Result{}, fmt.Errorf("%s", msg)
+			}
+		}
 
 		state := agent.State{
 			Server:           *wireguard.DeepCopy(),
