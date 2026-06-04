@@ -492,75 +492,52 @@ func (r *WireguardReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			continue
 		}
 
-		// Resolve & validate the peer's public key before the skip check below.
-		// Precedence: spec.publicKey literal, then publicKeyRef -> Secret key
-		// (external peer whose key material lives outside the cluster, e.g.
-		// 1Password via an ExternalSecret), then derived from the private key
-		// (privateKeyRef) when we hold it. This lets a peer be declared with
-		// ONLY a public key (we never see its private key — the migrated-
-		// customer case) OR with only a private key (we hold it; the public key
-		// is computed).
-		//
-		// FAIL CLOSED: if BOTH a private key and an explicit public key are
-		// present, they MUST match (the public key must be the curve25519
-		// derivation of the private key). On mismatch we mark the peer Error
-		// and refuse to install it into the server config — a swapped/typo'd
-		// key never silently takes effect.
-		specifiedPub := peer.Spec.PublicKey
-		if specifiedPub == "" && peer.Spec.PublicKeyRef.SecretKeyRef.Name != "" {
-			pubSecret := &corev1.Secret{}
-			if err := r.Get(ctx, types.NamespacedName{Name: peer.Spec.PublicKeyRef.SecretKeyRef.Name, Namespace: peer.Namespace}, pubSecret); err == nil {
-				if v, ok := pubSecret.Data[peer.Spec.PublicKeyRef.SecretKeyRef.Key]; ok {
-					specifiedPub = strings.TrimSpace(string(v))
-				}
-			}
-		}
-		var derivedPub string
-		if peer.Spec.PrivateKey.SecretKeyRef.Name != "" {
-			privSecret := &corev1.Secret{}
-			if err := r.Get(ctx, types.NamespacedName{Name: peer.Spec.PrivateKey.SecretKeyRef.Name, Namespace: peer.Namespace}, privSecret); err == nil {
-				if v, ok := privSecret.Data[peer.Spec.PrivateKey.SecretKeyRef.Key]; ok {
-					if k, perr := wgtypes.ParseKey(strings.TrimSpace(string(v))); perr == nil {
-						derivedPub = k.PublicKey().String()
-					}
-				}
-			}
-		}
-		if specifiedPub != "" && derivedPub != "" && specifiedPub != derivedPub {
-			msg := fmt.Sprintf("public key %s does not match the key %s derived from the configured private key; refusing to install peer", specifiedPub, derivedPub)
-			log.Error(fmt.Errorf("peer public/private key mismatch"), msg, "peer", peer.Name)
-			peer.Status.Status = v1alpha1.Error
-			peer.Status.Message = msg
-			if err := r.Status().Update(ctx, &peer); err != nil {
-				log.Error(err, "Failed to update peer status after key mismatch", "peer", peer.Name)
-			}
-			continue
-		}
-		if specifiedPub != "" {
-			peer.Spec.PublicKey = specifiedPub
-		} else if derivedPub != "" {
-			peer.Spec.PublicKey = derivedPub
-		}
-
 		if peer.Spec.PublicKey == "" {
 			continue
 		}
 
-		if peer.Spec.Address == "" {
-			continue
-		}
-
-		// Resolve an optional preshared key from the referenced Secret into the
-		// agent state (state.json), mirroring how the server private key is
-		// resolved. The plaintext PSK lives only in the controller-written state
-		// Secret, never in the persisted WireguardPeer CR.
-		if peer.Spec.PresharedKeyRef.SecretKeyRef.Name != "" {
-			pskSecret := &corev1.Secret{}
-			if err := r.Get(ctx, types.NamespacedName{Name: peer.Spec.PresharedKeyRef.SecretKeyRef.Name, Namespace: peer.Namespace}, pskSecret); err == nil {
-				if v, ok := pskSecret.Data[peer.Spec.PresharedKeyRef.SecretKeyRef.Key]; ok {
-					peer.Spec.PresharedKey = strings.TrimSpace(string(v))
+		// FAIL CLOSED on a public/private key mismatch. The WireguardPeer
+		// reconciler resolves spec.publicKey (adopting the `<name>-peer` Secret
+		// or generating a keypair) and points spec.privateKeyRef at that Secret.
+		// If we hold a private key for this peer, the configured public key MUST
+		// be its curve25519 derivation — otherwise a swapped/typo'd key would
+		// silently take effect. On mismatch, mark the peer Error and refuse to
+		// install it into the server config. External (public-key-only) peers
+		// have no private key here, so this check is skipped for them.
+		if peer.Spec.PrivateKey.SecretKeyRef.Name != "" {
+			privSecret := &corev1.Secret{}
+			if err := r.Get(ctx, types.NamespacedName{Name: peer.Spec.PrivateKey.SecretKeyRef.Name, Namespace: peer.Namespace}, privSecret); err == nil {
+				if v, ok := privSecret.Data[peer.Spec.PrivateKey.SecretKeyRef.Key]; ok && strings.TrimSpace(string(v)) != "" {
+					if k, perr := wgtypes.ParseKey(strings.TrimSpace(string(v))); perr == nil {
+						if derived := k.PublicKey().String(); derived != peer.Spec.PublicKey {
+							msg := fmt.Sprintf("public key %s does not match the key %s derived from the configured private key; refusing to install peer", peer.Spec.PublicKey, derived)
+							log.Error(fmt.Errorf("peer public/private key mismatch"), msg, "peer", peer.Name)
+							peer.Status.Status = v1alpha1.Error
+							peer.Status.Message = msg
+							if err := r.Status().Update(ctx, &peer); err != nil {
+								log.Error(err, "Failed to update peer status after key mismatch", "peer", peer.Name)
+							}
+							continue
+						}
+					}
 				}
 			}
+		}
+
+		// Carry an optional preshared key from the per-peer `<name>-peer` Secret
+		// (the same convention Secret the peer reconciler adopts/creates) into
+		// the agent state, so the server-side [Peer] block emits PresharedKey.
+		// For migrated external peers the PSK is supplied from 1Password via an
+		// ExternalSecret targeting `<name>-peer`. Absent key => no PSK (default).
+		pskSecret := &corev1.Secret{}
+		if err := r.Get(ctx, types.NamespacedName{Name: peer.Name + "-peer", Namespace: peer.Namespace}, pskSecret); err == nil {
+			if v, ok := pskSecret.Data["presharedKey"]; ok {
+				peer.Spec.PresharedKey = strings.TrimSpace(string(v))
+			}
+		}
+
+		if peer.Spec.Address == "" {
+			continue
 		}
 
 		filteredPeers = append(filteredPeers, peer)

@@ -19,6 +19,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/nccloud/wireguard-operator/api/v1alpha1"
 
@@ -135,14 +136,45 @@ func (r *WireguardPeerReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		getErr := r.Get(ctx, secretName, existing)
 		switch {
 		case getErr == nil:
-			privateKey = string(existing.Data["privateKey"])
-			parsed, parseErr := wgtypes.ParseKey(privateKey)
-			if parseErr != nil {
-				log.Error(parseErr, "Failed to parse existing privateKey", "secret.Namespace", secretName.Namespace, "secret.Name", secretName.Name)
-				return ctrl.Result{}, fmt.Errorf("parse existing privateKey for %s: %w", secretName.Name, parseErr)
+			privateKey = strings.TrimSpace(string(existing.Data["privateKey"]))
+			storedPub := strings.TrimSpace(string(existing.Data["publicKey"]))
+			switch {
+			case privateKey != "":
+				// We hold the private key: the public key is its curve25519
+				// derivation. If the Secret ALSO carries a publicKey, it must
+				// match — fail closed on a mismatched/swapped pair.
+				parsed, parseErr := wgtypes.ParseKey(privateKey)
+				if parseErr != nil {
+					log.Error(parseErr, "Failed to parse existing privateKey", "secret.Namespace", secretName.Namespace, "secret.Name", secretName.Name)
+					return ctrl.Result{}, fmt.Errorf("parse existing privateKey for %s: %w", secretName.Name, parseErr)
+				}
+				publicKey = parsed.PublicKey().String()
+				if storedPub != "" && storedPub != publicKey {
+					msg := fmt.Sprintf("secret %s: stored publicKey %s does not match the key %s derived from privateKey; refusing to configure peer", secretName.Name, storedPub, publicKey)
+					log.Error(fmt.Errorf("peer public/private key mismatch"), msg)
+					_ = r.updateStatus(ctx, newPeer, v1alpha1.Error, msg)
+					return ctrl.Result{}, fmt.Errorf("%s", msg)
+				}
+				log.Info("Adopting existing peer secret (private key)", "secret.Namespace", secretName.Namespace, "secret.Name", secretName.Name)
+			case storedPub != "":
+				// External / public-key-only peer: the customer holds the private
+				// key, we only have the public key (e.g. carried from a legacy
+				// stack and supplied via 1Password). Validate it parses, adopt it,
+				// and leave privateKeyRef unset.
+				if _, parseErr := wgtypes.ParseKey(storedPub); parseErr != nil {
+					msg := fmt.Sprintf("secret %s: stored publicKey is not a valid WireGuard key: %v", secretName.Name, parseErr)
+					log.Error(parseErr, msg)
+					_ = r.updateStatus(ctx, newPeer, v1alpha1.Error, msg)
+					return ctrl.Result{}, fmt.Errorf("%s", msg)
+				}
+				publicKey = storedPub
+				log.Info("Adopting existing peer secret (public key only / external)", "secret.Namespace", secretName.Namespace, "secret.Name", secretName.Name)
+			default:
+				// Secret exists but has no key material yet (e.g. an ExternalSecret
+				// target mid-sync). Requeue until it is populated.
+				log.Info("Peer secret present but has no key material yet; requeueing", "secret.Name", secretName.Name)
+				return ctrl.Result{Requeue: true}, nil
 			}
-			publicKey = parsed.PublicKey().String()
-			log.Info("Adopting existing peer secret", "secret.Namespace", secretName.Namespace, "secret.Name", secretName.Name)
 		case errors.IsNotFound(getErr):
 			privateKey = key.String()
 			publicKey = key.PublicKey().String()
@@ -164,8 +196,14 @@ func (r *WireguardPeerReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// — KRO and other controllers may own those).
 		patch := client.MergeFrom(peer.DeepCopy())
 		newPeer.Spec.PublicKey = publicKey
-		newPeer.Spec.PrivateKey = v1alpha1.PrivateKey{
-			SecretKeyRef: corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: secretName.Name}, Key: "privateKey"}}
+		// Only point privateKeyRef at the Secret when we actually hold a private
+		// key. External (public-key-only) peers leave it unset — there is no
+		// private key to reference, and a downloadable client config can't (and
+		// shouldn't) be generated for a key the customer already holds.
+		if privateKey != "" {
+			newPeer.Spec.PrivateKey = v1alpha1.PrivateKey{
+				SecretKeyRef: corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: secretName.Name}, Key: "privateKey"}}
+		}
 		if err := r.Patch(ctx, newPeer, patch); err != nil {
 			log.Error(err, "Failed to patch peer with public key + secret ref", "secret.Namespace", secretName.Namespace, "secret.Name", secretName.Name)
 			return ctrl.Result{}, fmt.Errorf("patch WireguardPeer with public key + secret ref: %w", err)
