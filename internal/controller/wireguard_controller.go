@@ -491,6 +491,34 @@ func (r *WireguardReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		if peer.Spec.WireguardRef != wireguard.Name {
 			continue
 		}
+
+		// Resolve the peer's public key before the skip check below. Precedence:
+		//   1. spec.publicKey literal (set directly on the CR)
+		//   2. spec.publicKeyRef -> Secret key (external peer; key material held
+		//      outside the cluster, e.g. 1Password via an ExternalSecret)
+		//   3. derived from the private key (spec.privateKeyRef) when we hold it
+		// This lets a peer be declared with ONLY a public key (we never see its
+		// private key — the migrated-customer case) OR with only a private key
+		// (we hold it; the public key is computed). Mirrors the PSK resolution.
+		if peer.Spec.PublicKey == "" && peer.Spec.PublicKeyRef.SecretKeyRef.Name != "" {
+			pubSecret := &corev1.Secret{}
+			if err := r.Get(ctx, types.NamespacedName{Name: peer.Spec.PublicKeyRef.SecretKeyRef.Name, Namespace: peer.Namespace}, pubSecret); err == nil {
+				if v, ok := pubSecret.Data[peer.Spec.PublicKeyRef.SecretKeyRef.Key]; ok {
+					peer.Spec.PublicKey = strings.TrimSpace(string(v))
+				}
+			}
+		}
+		if peer.Spec.PublicKey == "" && peer.Spec.PrivateKey.SecretKeyRef.Name != "" {
+			privSecret := &corev1.Secret{}
+			if err := r.Get(ctx, types.NamespacedName{Name: peer.Spec.PrivateKey.SecretKeyRef.Name, Namespace: peer.Namespace}, privSecret); err == nil {
+				if v, ok := privSecret.Data[peer.Spec.PrivateKey.SecretKeyRef.Key]; ok {
+					if k, perr := wgtypes.ParseKey(strings.TrimSpace(string(v))); perr == nil {
+						peer.Spec.PublicKey = k.PublicKey().String()
+					}
+				}
+			}
+		}
+
 		if peer.Spec.PublicKey == "" {
 			continue
 		}

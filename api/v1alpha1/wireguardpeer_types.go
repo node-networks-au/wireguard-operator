@@ -51,6 +51,13 @@ type WireguardPeerSpec struct {
 	PrivateKey PrivateKey `json:"privateKeyRef,omitempty"`
 	// The key used by the peer to authenticate with the wg server.
 	PublicKey string `json:"publicKey,omitempty"`
+	// Optional reference to a Secret key holding the peer's PUBLIC key. Used
+	// for external peers whose key material lives outside the cluster (e.g. in
+	// 1Password, surfaced via an ExternalSecret) rather than as a CR literal.
+	// Resolution precedence for the public key: spec.publicKey literal, then
+	// publicKeyRef, then derived from the private key (privateKeyRef) when we
+	// hold it. Mirrors privateKeyRef / presharedKeyRef.
+	PublicKeyRef PrivateKey `json:"publicKeyRef,omitempty"`
 	// Optional reference to a Secret key holding the preshared key (PSK) for
 	// this peer. When set, the server-side [Peer] block includes the resolved
 	// PresharedKey. Mirrors privateKeyRef.

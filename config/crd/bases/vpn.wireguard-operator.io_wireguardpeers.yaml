@@ -200,6 +200,42 @@ spec:
                 description: The key used by the peer to authenticate with the wg
                   server.
                 type: string
+              publicKeyRef:
+                description: |-
+                  Optional reference to a Secret key holding the peer's PUBLIC key. Used
+                  for external peers whose key material lives outside the cluster (e.g. in
+                  1Password, surfaced via an ExternalSecret) rather than as a CR literal.
+                  Resolution precedence for the public key: spec.publicKey literal, then
+                  publicKeyRef, then derived from the private key (privateKeyRef) when we
+                  hold it. Mirrors privateKeyRef / presharedKeyRef.
+                properties:
+                  secretKeyRef:
+                    description: SecretKeySelector selects a key of a Secret.
+                    properties:
+                      key:
+                        description: The key of the secret to select from.  Must be
+                          a valid secret key.
+                        type: string
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                      optional:
+                        description: Specify whether the Secret or its key must be
+                          defined
+                        type: boolean
+                    required:
+                    - key
+                    type: object
+                    x-kubernetes-map-type: atomic
+                required:
+                - secretKeyRef
+                type: object
               routes:
                 description: |-
                   Routes are downstream IPv4 CIDRs reachable through this peer. They
