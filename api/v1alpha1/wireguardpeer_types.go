@@ -51,6 +51,13 @@ type WireguardPeerSpec struct {
 	PrivateKey PrivateKey `json:"privateKeyRef,omitempty"`
 	// The key used by the peer to authenticate with the wg server.
 	PublicKey string `json:"publicKey,omitempty"`
+	// Optional reference to a Secret key holding the preshared key (PSK) for
+	// this peer. When set, the server-side [Peer] block includes the resolved
+	// PresharedKey. Mirrors privateKeyRef.
+	PresharedKeyRef PrivateKey `json:"presharedKeyRef,omitempty"`
+	// Resolved preshared-key value. Populated by the controller from
+	// PresharedKeyRef into the agent state; do not set this field directly.
+	PresharedKey string `json:"presharedKey,omitempty"`
 	// The name of the Wireguard instance in k8s that the peer belongs to. The wg instance should be in the same namespace as the peer.
 	//+kubebuilder:validation:Required
 	//+kubebuilder:validation:MinLength=1

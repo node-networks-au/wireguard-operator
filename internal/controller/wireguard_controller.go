@@ -499,6 +499,19 @@ func (r *WireguardReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			continue
 		}
 
+		// Resolve an optional preshared key from the referenced Secret into the
+		// agent state (state.json), mirroring how the server private key is
+		// resolved. The plaintext PSK lives only in the controller-written state
+		// Secret, never in the persisted WireguardPeer CR.
+		if peer.Spec.PresharedKeyRef.SecretKeyRef.Name != "" {
+			pskSecret := &corev1.Secret{}
+			if err := r.Get(ctx, types.NamespacedName{Name: peer.Spec.PresharedKeyRef.SecretKeyRef.Name, Namespace: peer.Namespace}, pskSecret); err == nil {
+				if v, ok := pskSecret.Data[peer.Spec.PresharedKeyRef.SecretKeyRef.Key]; ok {
+					peer.Spec.PresharedKey = strings.TrimSpace(string(v))
+				}
+			}
+		}
+
 		filteredPeers = append(filteredPeers, peer)
 	}
 

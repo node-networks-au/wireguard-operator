@@ -128,6 +128,44 @@ spec:
                 maximum: 65535
                 minimum: 1
                 type: integer
+              presharedKey:
+                description: |-
+                  Resolved preshared-key value. Populated by the controller from
+                  PresharedKeyRef into the agent state; do not set this field directly.
+                type: string
+              presharedKeyRef:
+                description: |-
+                  Optional reference to a Secret key holding the preshared key (PSK) for
+                  this peer. When set, the server-side [Peer] block includes the resolved
+                  PresharedKey. Mirrors privateKeyRef.
+                properties:
+                  secretKeyRef:
+                    description: SecretKeySelector selects a key of a Secret.
+                    properties:
+                      key:
+                        description: The key of the secret to select from.  Must be
+                          a valid secret key.
+                        type: string
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                      optional:
+                        description: Specify whether the Secret or its key must be
+                          defined
+                        type: boolean
+                    required:
+                    - key
+                    type: object
+                    x-kubernetes-map-type: atomic
+                required:
+                - secretKeyRef
+                type: object
               privateKeyRef:
                 description: The private key of the peer
                 properties:

@@ -603,6 +603,11 @@ func BuildWgQuickConfig(state agent.State, listenPort int) (string, error) {
 
 		fmt.Fprintf(&b, "\n[Peer]\nPublicKey = %s\nAllowedIPs = %s\n", peer.Spec.PublicKey, allowed)
 
+		// Per-peer preshared key (PSK), when resolved from PresharedKeyRef.
+		if peer.Spec.PresharedKey != "" {
+			fmt.Fprintf(&b, "PresharedKey = %s\n", peer.Spec.PresharedKey)
+		}
+
 		// Intentionally NO PersistentKeepalive on the server-side [Peer] block:
 		// the server sits behind a stable LoadBalancer IP (not behind NAT), so
 		// it has no mapping to keep alive. The whole design is responder-only —

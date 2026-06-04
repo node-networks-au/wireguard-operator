@@ -276,6 +276,7 @@ func (in *WireguardPeerList) DeepCopyObject() runtime.Object {
 func (in *WireguardPeerSpec) DeepCopyInto(out *WireguardPeerSpec) {
 	*out = *in
 	in.PrivateKey.DeepCopyInto(&out.PrivateKey)
+	in.PresharedKeyRef.DeepCopyInto(&out.PresharedKeyRef)
 	if in.EgressNetworkPolicies != nil {
 		in, out := &in.EgressNetworkPolicies, &out.EgressNetworkPolicies
 		*out = make(EgressNetworkPolicies, len(*in))
