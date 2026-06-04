@@ -603,7 +603,8 @@ func BuildWgQuickConfig(state agent.State, listenPort int) (string, error) {
 
 		fmt.Fprintf(&b, "\n[Peer]\nPublicKey = %s\nAllowedIPs = %s\n", peer.Spec.PublicKey, allowed)
 
-		// Per-peer preshared key (PSK), when resolved from PresharedKeyRef.
+		// Per-peer preshared key (PSK), when the controller resolved one from
+		// the peer's `<name>-peer` Secret (presharedKey key) into Spec.PresharedKey.
 		if peer.Spec.PresharedKey != "" {
 			fmt.Fprintf(&b, "PresharedKey = %s\n", peer.Spec.PresharedKey)
 		}
