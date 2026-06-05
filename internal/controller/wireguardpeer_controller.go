@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -102,8 +103,14 @@ func (r *WireguardPeerReconciler) secretForPeer(m *v1alpha1.WireguardPeer, priva
 		},
 		Data: map[string][]byte{"privateKey": []byte(privateKey), "publicKey": []byte(publicKey)},
 	}
-	// Set Nodered instance as the owner and controller
-	_ = ctrl.SetControllerReference(m, dep, r.Scheme)
+	// Set the peer as a plain (NON-controller) owner. A controller owner reference
+	// here blocks external-secrets (creationPolicy: Owner) from claiming
+	// controllership of the same Secret — its GetControllerOf check sees a foreign
+	// controller and fails with "failed to take ownership". A non-controller owner
+	// still cascades garbage collection when the peer is deleted, but leaves the
+	// controller slot free for external-secrets to adopt and overwrite with the
+	// real key (the operator then yields — see key-provenance design).
+	_ = controllerutil.SetOwnerReference(m, dep, r.Scheme)
 
 	return dep
 

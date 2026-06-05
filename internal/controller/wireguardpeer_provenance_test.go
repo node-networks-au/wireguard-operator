@@ -218,4 +218,27 @@ var _ = Describe("wireguardpeer controller — key provenance", func() {
 			g.Expect(got.Annotations).To(HaveKeyWithValue(keyOriginAnno, "external"))
 		}, Timeout, Interval).Should(Succeed())
 	})
+
+	// 7 (scope B) — the generated Secret must NOT be controller-owned by the peer,
+	// so external-secrets can claim controllership; the peer stays a plain owner
+	// so garbage collection still cascades.
+	It("creates the generated Secret with a non-controller owner reference", func() {
+		mkWireguard("vpn-prov-7")
+		peerName := "prov-noncontroller-7"
+		mkPeer(peerName, "vpn-prov-7", "") // no Secret → operator generates + creates it
+
+		secretKey := types.NamespacedName{Name: peerName + "-peer", Namespace: wgNamespace}
+		Eventually(func(g Gomega) {
+			s := &corev1.Secret{}
+			g.Expect(k8sClient.Get(ctx, secretKey, s)).To(Succeed())
+			peerIsOwner := false
+			for _, o := range s.GetOwnerReferences() {
+				if o.Kind == "WireguardPeer" && o.Name == peerName {
+					peerIsOwner = true
+				}
+			}
+			g.Expect(peerIsOwner).To(BeTrue())              // GC intact
+			g.Expect(metav1.GetControllerOf(s)).To(BeNil()) // not controller-owned
+		}, Timeout, Interval).Should(Succeed())
+	})
 })
