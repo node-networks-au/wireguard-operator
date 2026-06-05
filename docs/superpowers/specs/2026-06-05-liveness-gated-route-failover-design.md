@@ -122,16 +122,18 @@ long-lived `wgctrl.Client`. Define **last-progress** = the most recent of
   ~2.4× sooner with zero added traffic. `age > 180 s` is WireGuard's own dead-key
   point (`REJECT_AFTER_TIME`) — the keepalive-less backstop.
 - **`active`:** as passive, but the agent **probes** a quiet peer on its own
-  cadence rather than waiting for keepalives. Each loop iteration
-  (`WG_ROUTE_INTERVAL`, the active-mode probe timer, default **5 s** =
-  `REKEY_TIMEOUT`), if a peer's last-progress age exceeds the interval the agent
-  sends a packet to the peer's **`/32`** (routes via the retained base) to **force
-  a handshake**. After **`N` consecutive unanswered probes** (same
-  `WG_ROUTE_FAILURE_COUNT` modifier as passive) with no inbound progress, the peer
-  is **down** — so active down-latency ≈ `N × WG_ROUTE_INTERVAL` (≈ **15 s** at the
-  defaults), independent of the peer's keepalive. The same probe revives a not-live
-  peer with a known endpoint, closing the keepalive-less recovery deadlock.
-  Keepalive-less peers are probed identically (active mode doesn't depend on `k`).
+  cadence rather than waiting for keepalives. Every **`WG_ROUTE_PROBE_INTERVAL`**
+  (default **5 s** = `REKEY_TIMEOUT`), if a peer's last-progress age exceeds that
+  interval the agent sends a packet to the peer's **`/32`** (routes via the
+  retained base) to **force a handshake**. After **`N` consecutive unanswered
+  probes** (same `WG_ROUTE_FAILURE_COUNT` modifier as passive) with no inbound
+  progress, the peer is **down** — so active down-latency ≈
+  `N × WG_ROUTE_PROBE_INTERVAL` (≈ **15 s** at the defaults), independent of the
+  peer's keepalive. The same probe revives a not-live peer with a known endpoint,
+  closing the keepalive-less recovery deadlock. Keepalive-less peers are probed
+  identically (active mode doesn't depend on `k`). Probing is rate-limited to
+  `WG_ROUTE_PROBE_INTERVAL` even though the loop ticks faster
+  (`WG_ROUTE_INTERVAL`).
 
 A fresh handshake or any inbound progress → **live on the next tick** (≤ 1 s).
 There is **no separate anti-flap margin** — a single threshold; healthy keepalive
@@ -139,10 +141,11 @@ peers never approach it.
 
 ## Watcher loop
 
-- A dedicated goroutine ticks every **`WG_ROUTE_INTERVAL`** (default **5 s**;
-  measured cost ~0.5 ms `wgctrl` read even at 38 peers — negligible, so the
-  interval is bounded by probe-aggressiveness/recovery latency, not CPU). It
-  refreshes per-peer liveness; in `active` mode each tick is also a probe pass.
+- A dedicated goroutine ticks every **`WG_ROUTE_INTERVAL`** (default **1 s**;
+  measured cost ~0.5 ms `wgctrl` read even at 38 peers — negligible, so we tick
+  fast for ~1 s bring-up/recovery, ≈ the static path's near-instant attach). It
+  refreshes per-peer liveness; in `active` mode it also sends any **due** `/32`
+  probes (rate-limited to `WG_ROUTE_PROBE_INTERVAL`, not every tick).
 - **Edge-triggered:** only when a peer's live↔not-live state **transitions** does
   it call the existing **`wg.Sync(latestState)`** (idempotent — `syncconf` diff +
   `RouteReplace`/`RouteDel`). Quiet ticks do no writes.
@@ -157,14 +160,23 @@ peers never approach it.
 |---|---|---|---|
 | `WG_ROUTE_LIVENESS` | `disabled` | all | `disabled` \| `passive` \| `active` — selects the `LivenessSource` (or none). |
 | `WG_ROUTE_FAILURE_COUNT` | `3` | passive + active | **`N`** — consecutive failures tolerated before **down**. Passive: `N` missed keepalive intervals (`downWindow = N × k`). Active: `N` consecutive unanswered probes. **One modifier, shared by both.** |
-| `WG_ROUTE_INTERVAL` | `5s` | passive + active | watcher loop cadence (one cheap `wgctrl` read; applies only on a transition). In `active` mode it doubles as the `/32` probe interval, so active down-latency ≈ `N × WG_ROUTE_INTERVAL` and recovery ≤ one interval. |
+| `WG_ROUTE_INTERVAL` | `1s` | passive + active | watcher loop / `wgctrl`-read cadence (one cheap read per tick; applies wg0 only on a transition). Sets sample resolution and **up/recovery latency (≤ one interval)** — 1 s ≈ the static path's near-instant attach. |
+| `WG_ROUTE_PROBE_INTERVAL` | `5s` | active only | `/32` handshake-probe cadence. Kept separate from (and ≥) `WG_ROUTE_INTERVAL` so fast reads don't mean fast probing. Active down-latency ≈ `N × WG_ROUTE_PROBE_INTERVAL`. |
 
 Per-peer keepalive `k` is **not** an env var — it's read from each peer's
-`spec.PersistentKeepalive`. `N` and `WG_ROUTE_INTERVAL` are the operator-tunable
-modifiers layered on top of it. (There is **no** separate fast "tick": sampling
-finer than the probe cadence buys nothing — passive's `N × k` threshold and
-active's `N × interval` floor are both ≫ a few seconds, and reads are cheap but
-probes shouldn't be more aggressive than the interval.)
+`spec.PersistentKeepalive`. `N`, `WG_ROUTE_INTERVAL`, and `WG_ROUTE_PROBE_INTERVAL`
+are the operator-tunable modifiers layered on top of it. The read cadence and probe
+cadence are **deliberately separate**: reads are ~free so we tick fast (1 s) for
+quick bring-up/recovery, while probes force handshakes and must stay rate-limited
+(5 s) to avoid spam.
+
+**Delivery:** these are **new** knobs (the agent has no interval/env config today —
+only fsnotify + `/health` reconcile). The agent reads them via `os.Getenv` with the
+defaults above, so **unset ⇒ `disabled` ⇒ exact current behavior**. Enabling/tuning
+requires the operator's agent Deployment template (`internal/resources/deployment.go`)
+to set the env on the agent container — a minimal, **non-CRD** operator-side touch
+(plan item). Per-`Wireguard`-CR control would be a controller change and is
+deferred.
 
 ## Failover semantics (worked: optimised DC1/DC2)
 
