@@ -109,8 +109,9 @@ long-lived `wgctrl.Client`. Define **last-progress** = the most recent of
 - **`passive`:** a peer is **live** while `age(last-progress) ≤ downWindow`, where
   **`downWindow` is computed per-peer from that peer's own
   `spec.PersistentKeepalive`** (`*int32`, read from `state.json`):
-  - keepalive set (`k > 0`): `downWindow = 3 × k` (≈ **75 s** for a 25 s peer —
-    tolerates 2 lost keepalives). Each peer's window scales to its own `k`, so
+  - keepalive set (`k > 0`): `downWindow = N × k`, where **`N` =
+    `WG_ROUTE_FAILURE_COUNT`** (default **3** — tolerate 3 missed keepalives;
+    ≈ **75 s** for a 25 s peer). Each peer's window scales to its own `k`, so
     peers with different keepalive intervals get different windows.
   - keepalive unset/`nil`/`0`: fall back to `REJECT_AFTER_TIME = 180 s`
     (WireGuard's dead-key point — the only passive signal available without
@@ -120,14 +121,17 @@ long-lived `wgctrl.Client`. Define **last-progress** = the most recent of
   **every** inbound packet incl. each keepalive (~25 s), so it detects silence
   ~2.4× sooner with zero added traffic. `age > 180 s` is WireGuard's own dead-key
   point (`REJECT_AFTER_TIME`) — the keepalive-less backstop.
-- **`active`:** as passive, but when last-progress stalls past `2 × k` (the
-  **per-peer** keepalive; ~50 s for a 25 s peer) the agent sends a packet to the
-  peer's **`/32`** (routes via the retained base) to **force a handshake**; if no
-  inbound progress after ~3 × `REKEY_TIMEOUT` (~15 s) the peer is **down**
-  (≈ 50–65 s, with confirmation). Keepalive-less peers (no `k`) use the passive
-  180 s path and are only probed for *recovery*, not accelerated down-detection.
-  The same probe revives a not-live peer with a known endpoint, closing the
-  keepalive-less recovery deadlock.
+- **`active`:** as passive, but the agent **probes** a quiet peer on its own
+  cadence rather than waiting for keepalives. Once a peer's last-progress age
+  exceeds the probe interval **`p` = `WG_ROUTE_ACTIVE_PROBE_INTERVAL`** (the
+  active-mode timer, default **5 s** = `REKEY_TIMEOUT`), the agent sends a packet
+  to the peer's **`/32`** (routes via the retained base) to **force a handshake**,
+  repeating every `p`. After **`N` consecutive unanswered probes** (same
+  `WG_ROUTE_FAILURE_COUNT` modifier as passive) with no inbound progress, the peer
+  is **down** — so active down-latency ≈ `N × p` (≈ **15 s** at the defaults),
+  independent of the peer's keepalive. The same probe revives a not-live peer with
+  a known endpoint, closing the keepalive-less recovery deadlock. Keepalive-less
+  peers are probed identically (active mode doesn't depend on `k`).
 
 A fresh handshake or any inbound progress → **live on the next tick** (≤ 1 s).
 There is **no separate anti-flap margin** — a single threshold; healthy keepalive
@@ -144,6 +148,19 @@ peers never approach it.
   and read by the watcher, so config changes and liveness changes compose through
   the one `Sync` path. `Sync` always computes routes as a pure function of
   `(latestState, liveness)`.
+
+## Configuration
+
+| Env var | Default | Applies | Meaning |
+|---|---|---|---|
+| `WG_ROUTE_LIVENESS` | `disabled` | all | `disabled` \| `passive` \| `active` — selects the `LivenessSource` (or none). |
+| `WG_ROUTE_FAILURE_COUNT` | `3` | passive + active | **`N`** — consecutive failures tolerated before **down**. Passive: `N` missed keepalive intervals (`downWindow = N × k`). Active: `N` consecutive unanswered probes. **One modifier, shared by both.** |
+| `WG_ROUTE_ACTIVE_PROBE_INTERVAL` | `5s` | active only | **`p`** — the active-mode probe/keepalive timer (the agent's own cadence for `/32` handshake-triggers). Active down-latency ≈ `N × p`. |
+| `WG_ROUTE_TICK` | `1s` | passive + active | watcher poll interval (cheap `wgctrl` read; apply only on transition). |
+
+Per-peer keepalive `k` is **not** an env var — it's read from each peer's
+`spec.PersistentKeepalive`. `N`/`p` are the operator-tunable modifiers layered on
+top of it.
 
 ## Failover semantics (worked: optimised DC1/DC2)
 
