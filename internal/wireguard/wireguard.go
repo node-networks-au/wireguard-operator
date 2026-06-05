@@ -227,7 +227,7 @@ func (wg *Wireguard) syncWireguard(state agent.State, iface string, listenPort i
 		return fmt.Errorf("create wg syncconf temp file: %w", err)
 	}
 	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
+	defer func() { _ = os.Remove(tmpPath) }()
 
 	if _, err := tmp.WriteString(cfg); err != nil {
 		_ = tmp.Close()
