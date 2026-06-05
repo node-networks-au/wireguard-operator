@@ -207,6 +207,65 @@ func TestBuildWgQuickConfig_OmitsPersistentKeepaliveWhenUnset(t *testing.T) {
 	}
 }
 
+// TestBuildWgQuickConfig_EmitsPresharedKeyWhenSet locks down the server-side
+// PSK render: when the controller has resolved peer.Spec.PresharedKey (from the
+// `<name>-peer` Secret's `presharedKey` key), the wg0 [Peer] block MUST emit a
+// `PresharedKey = <value>` line. The server enforces the PSK, so without this
+// the symmetric layer is missing and the migrated peers (which carry a legacy
+// PSK in their client config) get their handshake silently dropped.
+func TestBuildWgQuickConfig_EmitsPresharedKeyWhenSet(t *testing.T) {
+	const psk = "+5Sfa0dhfiGJdqzB+gcFirhyacqt2GjcLJEpoOSfCy0="
+	state := agent.State{
+		ServerPrivateKey: validServerPrivateKey,
+		Server:           v1alpha1.Wireguard{},
+		Peers: []v1alpha1.WireguardPeer{
+			{
+				Spec: v1alpha1.WireguardPeerSpec{
+					PublicKey:    validPeerPublicKey,
+					Address:      "172.31.255.2",
+					PresharedKey: psk,
+				},
+			},
+		},
+	}
+
+	cfg, err := BuildWgQuickConfig(state, 51820)
+	if err != nil {
+		t.Fatalf("BuildWgQuickConfig: %v", err)
+	}
+
+	if !strings.Contains(cfg, "PresharedKey = "+psk) {
+		t.Errorf("server-side [Peer] block must include the resolved PresharedKey line:\n%s", cfg)
+	}
+}
+
+// TestBuildWgQuickConfig_OmitsPresharedKeyWhenUnset is the backwards-compat
+// guard: peers without a PSK (the bulk of the fleet) must produce a [Peer]
+// block with no PresharedKey line, byte-identical to the pre-feature output.
+func TestBuildWgQuickConfig_OmitsPresharedKeyWhenUnset(t *testing.T) {
+	state := agent.State{
+		ServerPrivateKey: validServerPrivateKey,
+		Server:           v1alpha1.Wireguard{},
+		Peers: []v1alpha1.WireguardPeer{
+			{
+				Spec: v1alpha1.WireguardPeerSpec{
+					PublicKey: validPeerPublicKey,
+					Address:   "172.31.255.2",
+				},
+			},
+		},
+	}
+
+	cfg, err := BuildWgQuickConfig(state, 51820)
+	if err != nil {
+		t.Fatalf("BuildWgQuickConfig: %v", err)
+	}
+
+	if strings.Contains(cfg, "PresharedKey") {
+		t.Errorf("PresharedKey must NOT appear when the peer has no resolved PSK:\n%s", cfg)
+	}
+}
+
 // TestBuildWgQuickConfig_RoutesAppendedToAllowedIPs locks down Phase G: when
 // WireguardPeer.spec.routes is set, the rendered server-side [Peer] AllowedIPs
 // CSV must include the peer's own /32 PLUS every CIDR in Routes. This is what
