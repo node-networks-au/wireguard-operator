@@ -19,6 +19,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/nccloud/wireguard-operator/api/v1alpha1"
 
@@ -30,8 +31,47 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
+
+const (
+	// keyOriginAnnotation records how the operator established spec.PublicKey.
+	// Its ABSENCE marks a peer provisioned before provenance tracking (legacy)
+	// or a user-declared key — surfaced by the key-origin metric.
+	keyOriginAnnotation = "vpn.wireguard-operator.io/key-origin"
+	// keyOriginGenerated: the operator minted the keypair itself. Not
+	// authoritative — yields to an external Secret that later disagrees.
+	keyOriginGenerated = "generated"
+	// keyOriginExternal: the key came from an external Secret (adopted, or
+	// re-adopted from one). Hard-set — a later disagreement fails closed.
+	keyOriginExternal = "external"
+)
+
+// setKeyOrigin stamps the provenance annotation on a peer (in memory).
+func setKeyOrigin(peer *v1alpha1.WireguardPeer, origin string) {
+	if peer.Annotations == nil {
+		peer.Annotations = map[string]string{}
+	}
+	peer.Annotations[keyOriginAnnotation] = origin
+}
+
+// secretOwnedByPeer reports whether the Secret carries this peer as an owner —
+// i.e. the operator created it (secretForPeer sets the controller ref).
+// Externally-provided Secrets (e.g. external-secrets) are owned by something
+// else, so this is a reliable "did the operator mint this key" signal even when
+// a stale-cache reconcile re-enters provisioning and finds the Secret already
+// present.
+func secretOwnedByPeer(secret *corev1.Secret, peerName string) bool {
+	for _, ref := range secret.OwnerReferences {
+		if ref.Kind == "WireguardPeer" && ref.Name == peerName {
+			return true
+		}
+	}
+	return false
+}
 
 // WireguardPeerReconciler reconciles a WireguardPeer object
 
@@ -63,11 +103,40 @@ func (r *WireguardPeerReconciler) secretForPeer(m *v1alpha1.WireguardPeer, priva
 		},
 		Data: map[string][]byte{"privateKey": []byte(privateKey), "publicKey": []byte(publicKey)},
 	}
-	// Set Nodered instance as the owner and controller
-	_ = ctrl.SetControllerReference(m, dep, r.Scheme)
+	// Set the peer as a plain (NON-controller) owner. A controller owner reference
+	// here blocks external-secrets (creationPolicy: Owner) from claiming
+	// controllership of the same Secret — its GetControllerOf check sees a foreign
+	// controller and fails with "failed to take ownership". A non-controller owner
+	// still cascades garbage collection when the peer is deleted, but leaves the
+	// controller slot free for external-secrets to adopt and overwrite with the
+	// real key (the operator then yields — see key-provenance design).
+	_ = controllerutil.SetOwnerReference(m, dep, r.Scheme)
 
 	return dep
 
+}
+
+// secretDerivedPubKey returns the public key derived from the <peer>-peer
+// Secret's privateKey. present is false when no such Secret exists or it has no
+// privateKey; genuine get/parse failures are returned as err.
+func (r *WireguardPeerReconciler) secretDerivedPubKey(ctx context.Context, peer *v1alpha1.WireguardPeer) (pub string, present bool, err error) {
+	secret := &corev1.Secret{}
+	getErr := r.Get(ctx, types.NamespacedName{Name: peer.Name + "-peer", Namespace: peer.Namespace}, secret)
+	switch {
+	case errors.IsNotFound(getErr):
+		return "", false, nil
+	case getErr != nil:
+		return "", false, fmt.Errorf("get peer secret %s-peer: %w", peer.Name, getErr)
+	}
+	priv := string(secret.Data["privateKey"])
+	if priv == "" {
+		return "", false, nil
+	}
+	parsed, parseErr := wgtypes.ParseKey(priv)
+	if parseErr != nil {
+		return "", false, fmt.Errorf("parse privateKey for %s-peer: %w", peer.Name, parseErr)
+	}
+	return parsed.PublicKey().String(), true, nil
 }
 
 //+kubebuilder:rbac:groups=vpn.wireguard-operator.io,resources=wireguardpeers,verbs=get;list;watch;create;update;patch;delete
@@ -121,7 +190,7 @@ func (r *WireguardPeerReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if peer.Spec.PublicKey == "" {
 		secretName := types.NamespacedName{Name: peer.Name + "-peer", Namespace: peer.Namespace}
 
-		var privateKey, publicKey string
+		var privateKey, publicKey, origin string
 
 		// Try to adopt an existing <peer>-peer Secret first. This is the
 		// path hit when ops pre-clone a peer keypair (e.g. for tenant
@@ -142,10 +211,18 @@ func (r *WireguardPeerReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 				return ctrl.Result{}, fmt.Errorf("parse existing privateKey for %s: %w", secretName.Name, parseErr)
 			}
 			publicKey = parsed.PublicKey().String()
+			// A Secret the operator owns means we minted this key (a stale-cache
+			// re-entry after generating); anything else is externally provided.
+			if secretOwnedByPeer(existing, peer.Name) {
+				origin = keyOriginGenerated
+			} else {
+				origin = keyOriginExternal
+			}
 			log.Info("Adopting existing peer secret", "secret.Namespace", secretName.Namespace, "secret.Name", secretName.Name)
 		case errors.IsNotFound(getErr):
 			privateKey = key.String()
 			publicKey = key.PublicKey().String()
+			origin = keyOriginGenerated
 
 			secret := r.secretForPeer(peer, privateKey, publicKey)
 
@@ -166,6 +243,7 @@ func (r *WireguardPeerReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		newPeer.Spec.PublicKey = publicKey
 		newPeer.Spec.PrivateKey = v1alpha1.PrivateKey{
 			SecretKeyRef: corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: secretName.Name}, Key: "privateKey"}}
+		setKeyOrigin(newPeer, origin)
 		if err := r.Patch(ctx, newPeer, patch); err != nil {
 			log.Error(err, "Failed to patch peer with public key + secret ref", "secret.Namespace", secretName.Namespace, "secret.Name", secretName.Name)
 			return ctrl.Result{}, fmt.Errorf("patch WireguardPeer with public key + secret ref: %w", err)
@@ -173,6 +251,41 @@ func (r *WireguardPeerReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 		return ctrl.Result{Requeue: true}, nil
 
+	}
+
+	// spec.PublicKey is already set. Reconcile it against the peer Secret on
+	// every pass. A *generated* key is not authoritative: if the Secret later
+	// yields a different key (e.g. external-secrets finally synced the real 1P
+	// key after losing the create race) re-adopt it. A *hard-set* key (declared
+	// in a manifest, or previously adopted from an external Secret) that
+	// disagrees is a genuine two-hard-set-values conflict — fail closed rather
+	// than silently pick a side.
+	secretPub, present, err := r.secretDerivedPubKey(ctx, peer)
+	if err != nil {
+		log.Error(err, "Failed to derive public key from peer secret")
+		return ctrl.Result{}, err
+	}
+	if present && secretPub != peer.Spec.PublicKey {
+		if peer.Annotations[keyOriginAnnotation] == keyOriginGenerated {
+			log.Info("Re-adopting external key over previously generated key",
+				"peer", peer.Name, "from", peer.Spec.PublicKey, "to", secretPub)
+			patch := client.MergeFrom(peer.DeepCopy())
+			newPeer.Spec.PublicKey = secretPub
+			newPeer.Spec.PrivateKey = v1alpha1.PrivateKey{
+				SecretKeyRef: corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: peer.Name + "-peer"}, Key: "privateKey"}}
+			setKeyOrigin(newPeer, keyOriginExternal)
+			if err := r.Patch(ctx, newPeer, patch); err != nil {
+				log.Error(err, "Failed to re-adopt external key")
+				return ctrl.Result{}, fmt.Errorf("re-adopt external key for %s: %w", peer.Name, err)
+			}
+			return ctrl.Result{Requeue: true}, nil
+		}
+		msg := fmt.Sprintf("spec.publicKey %s disagrees with peer secret-derived key %s; refusing to change", peer.Spec.PublicKey, secretPub)
+		log.Error(fmt.Errorf("public key conflict"), msg, "peer", peer.Name)
+		if err := r.updateStatus(ctx, newPeer, v1alpha1.Error, msg); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
 	}
 
 	wireguard := &v1alpha1.Wireguard{}
@@ -266,9 +379,28 @@ func (r *WireguardPeerReconciler) checkDuplicateAddress(ctx context.Context, nam
 	return "", nil
 }
 
+// peerForSecret maps a <peer>-peer Secret back to its WireguardPeer so that an
+// external change to the key material (e.g. external-secrets syncing the real
+// key) re-triggers reconciliation and the provenance check.
+func (r *WireguardPeerReconciler) peerForSecret(_ context.Context, obj client.Object) []reconcile.Request {
+	const suffix = "-peer"
+	name := obj.GetName()
+	if !strings.HasSuffix(name, suffix) || name == suffix {
+		return nil
+	}
+	return []reconcile.Request{{NamespacedName: types.NamespacedName{
+		Name:      strings.TrimSuffix(name, suffix),
+		Namespace: obj.GetNamespace(),
+	}}}
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *WireguardPeerReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := RegisterKeyOriginCollector(mgr.GetClient()); err != nil {
+		return err
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1alpha1.WireguardPeer{}).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.peerForSecret)).
 		Complete(r)
 }
