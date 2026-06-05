@@ -122,16 +122,16 @@ long-lived `wgctrl.Client`. Define **last-progress** = the most recent of
   ~2.4× sooner with zero added traffic. `age > 180 s` is WireGuard's own dead-key
   point (`REJECT_AFTER_TIME`) — the keepalive-less backstop.
 - **`active`:** as passive, but the agent **probes** a quiet peer on its own
-  cadence rather than waiting for keepalives. Once a peer's last-progress age
-  exceeds the probe interval **`p` = `WG_ROUTE_ACTIVE_PROBE_INTERVAL`** (the
-  active-mode timer, default **5 s** = `REKEY_TIMEOUT`), the agent sends a packet
-  to the peer's **`/32`** (routes via the retained base) to **force a handshake**,
-  repeating every `p`. After **`N` consecutive unanswered probes** (same
+  cadence rather than waiting for keepalives. Each loop iteration
+  (`WG_ROUTE_INTERVAL`, the active-mode probe timer, default **5 s** =
+  `REKEY_TIMEOUT`), if a peer's last-progress age exceeds the interval the agent
+  sends a packet to the peer's **`/32`** (routes via the retained base) to **force
+  a handshake**. After **`N` consecutive unanswered probes** (same
   `WG_ROUTE_FAILURE_COUNT` modifier as passive) with no inbound progress, the peer
-  is **down** — so active down-latency ≈ `N × p` (≈ **15 s** at the defaults),
-  independent of the peer's keepalive. The same probe revives a not-live peer with
-  a known endpoint, closing the keepalive-less recovery deadlock. Keepalive-less
-  peers are probed identically (active mode doesn't depend on `k`).
+  is **down** — so active down-latency ≈ `N × WG_ROUTE_INTERVAL` (≈ **15 s** at the
+  defaults), independent of the peer's keepalive. The same probe revives a not-live
+  peer with a known endpoint, closing the keepalive-less recovery deadlock.
+  Keepalive-less peers are probed identically (active mode doesn't depend on `k`).
 
 A fresh handshake or any inbound progress → **live on the next tick** (≤ 1 s).
 There is **no separate anti-flap margin** — a single threshold; healthy keepalive
@@ -139,8 +139,10 @@ peers never approach it.
 
 ## Watcher loop
 
-- A dedicated goroutine ticks every **1 s** (measured cost: ~0.5 ms `wgctrl` read
-  even at 38 peers — negligible). It refreshes per-peer liveness.
+- A dedicated goroutine ticks every **`WG_ROUTE_INTERVAL`** (default **5 s**;
+  measured cost ~0.5 ms `wgctrl` read even at 38 peers — negligible, so the
+  interval is bounded by probe-aggressiveness/recovery latency, not CPU). It
+  refreshes per-peer liveness; in `active` mode each tick is also a probe pass.
 - **Edge-triggered:** only when a peer's live↔not-live state **transitions** does
   it call the existing **`wg.Sync(latestState)`** (idempotent — `syncconf` diff +
   `RouteReplace`/`RouteDel`). Quiet ticks do no writes.
@@ -155,12 +157,14 @@ peers never approach it.
 |---|---|---|---|
 | `WG_ROUTE_LIVENESS` | `disabled` | all | `disabled` \| `passive` \| `active` — selects the `LivenessSource` (or none). |
 | `WG_ROUTE_FAILURE_COUNT` | `3` | passive + active | **`N`** — consecutive failures tolerated before **down**. Passive: `N` missed keepalive intervals (`downWindow = N × k`). Active: `N` consecutive unanswered probes. **One modifier, shared by both.** |
-| `WG_ROUTE_ACTIVE_PROBE_INTERVAL` | `5s` | active only | **`p`** — the active-mode probe/keepalive timer (the agent's own cadence for `/32` handshake-triggers). Active down-latency ≈ `N × p`. |
-| `WG_ROUTE_TICK` | `1s` | passive + active | watcher poll interval (cheap `wgctrl` read; apply only on transition). |
+| `WG_ROUTE_INTERVAL` | `5s` | passive + active | watcher loop cadence (one cheap `wgctrl` read; applies only on a transition). In `active` mode it doubles as the `/32` probe interval, so active down-latency ≈ `N × WG_ROUTE_INTERVAL` and recovery ≤ one interval. |
 
 Per-peer keepalive `k` is **not** an env var — it's read from each peer's
-`spec.PersistentKeepalive`. `N`/`p` are the operator-tunable modifiers layered on
-top of it.
+`spec.PersistentKeepalive`. `N` and `WG_ROUTE_INTERVAL` are the operator-tunable
+modifiers layered on top of it. (There is **no** separate fast "tick": sampling
+finer than the probe cadence buys nothing — passive's `N × k` threshold and
+active's `N × interval` floor are both ≫ a few seconds, and reads are cheap but
+probes shouldn't be more aggressive than the interval.)
 
 ## Failover semantics (worked: optimised DC1/DC2)
 
