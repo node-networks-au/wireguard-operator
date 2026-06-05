@@ -123,12 +123,13 @@ long-lived `wgctrl.Client`. Define **last-progress** = the most recent of
   point (`REJECT_AFTER_TIME`) — the keepalive-less backstop.
 - **`active`:** as passive, but the agent **probes** a quiet peer on its own
   cadence rather than waiting for keepalives. Every **`WG_ROUTE_PROBE_INTERVAL`**
-  (default **5 s** = `REKEY_TIMEOUT`), if a peer's last-progress age exceeds that
+  (default **15 s** = 3 × `REKEY_TIMEOUT`, so each probe gets a full handshake
+  retry cycle to complete), if a peer's last-progress age exceeds that
   interval the agent sends a packet to the peer's **`/32`** (routes via the
   retained base) to **force a handshake**. After **`N` consecutive unanswered
   probes** (same `WG_ROUTE_FAILURE_COUNT` modifier as passive) with no inbound
   progress, the peer is **down** — so active down-latency ≈
-  `N × WG_ROUTE_PROBE_INTERVAL` (≈ **15 s** at the defaults), independent of the
+  `N × WG_ROUTE_PROBE_INTERVAL` (≈ **45 s** at the defaults), independent of the
   peer's keepalive. The same probe revives a not-live peer with a known endpoint,
   closing the keepalive-less recovery deadlock. Keepalive-less peers are probed
   identically (active mode doesn't depend on `k`). Probing is rate-limited to
@@ -161,14 +162,14 @@ peers never approach it.
 | `WG_ROUTE_LIVENESS` | `disabled` | all | `disabled` \| `passive` \| `active` — selects the `LivenessSource` (or none). |
 | `WG_ROUTE_FAILURE_COUNT` | `3` | passive + active | **`N`** — consecutive failures tolerated before **down**. Passive: `N` missed keepalive intervals (`downWindow = N × k`). Active: `N` consecutive unanswered probes. **One modifier, shared by both.** |
 | `WG_ROUTE_CHECK_INTERVAL` | `1s` | passive + active | watcher loop / `wgctrl`-read cadence (one cheap read per tick; applies wg0 only on a transition). Sets sample resolution and **up/recovery latency (≤ one interval)** — 1 s ≈ the static path's near-instant attach. |
-| `WG_ROUTE_PROBE_INTERVAL` | `5s` | active only | `/32` handshake-probe cadence. Kept separate from (and ≥) `WG_ROUTE_CHECK_INTERVAL` so fast reads don't mean fast probing. Active down-latency ≈ `N × WG_ROUTE_PROBE_INTERVAL`. |
+| `WG_ROUTE_PROBE_INTERVAL` | `15s` | active only | `/32` handshake-probe cadence (3 × `REKEY_TIMEOUT`). Kept separate from (and ≥) `WG_ROUTE_CHECK_INTERVAL` so fast reads don't mean fast probing. Active down-latency ≈ `N × WG_ROUTE_PROBE_INTERVAL` (≈ 45 s at defaults). |
 
 Per-peer keepalive `k` is **not** an env var — it's read from each peer's
 `spec.PersistentKeepalive`. `N`, `WG_ROUTE_CHECK_INTERVAL`, and `WG_ROUTE_PROBE_INTERVAL`
 are the operator-tunable modifiers layered on top of it. The read cadence and probe
 cadence are **deliberately separate**: reads are ~free so we tick fast (1 s) for
 quick bring-up/recovery, while probes force handshakes and must stay rate-limited
-(5 s) to avoid spam.
+(15 s) to avoid spam.
 
 **Delivery:** these are **new** knobs (the agent has no interval/env config today —
 only fsnotify + `/health` reconcile). The agent reads them via `os.Getenv` with the
