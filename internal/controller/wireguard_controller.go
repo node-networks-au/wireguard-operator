@@ -285,22 +285,28 @@ func (r *WireguardReconciler) updateWireguardPeers(ctx context.Context, req ctrl
 			dnsConfiguration = dns + ", " + dnsSearchDomain
 		}
 
-		allowIps := peer.Spec.AllowedIPs
+		// Client-side AllowedIPs describes what the customer's device routes
+		// INTO the tunnel — a distinct concept from the server-side
+		// peer.Spec.AllowedIPs (the peer's identity / return-route CIDR the
+		// server enforces, rendered separately by the agent). Seeding the
+		// client config from peer.Spec.AllowedIPs produced a useless config:
+		// the RGD sets that to the peer's own <addr>/32, so the client routed
+		// nothing into the tunnel. We instead always hand out a full-tunnel
+		// default route; split-tunnel clients can trim it locally. Route
+		// family follows the peer's assigned address(es).
+		hasIPv4 := peer.Spec.Address != ""
+		hasIPv6 := peer.Spec.AddressV6 != ""
 
-		if allowIps == "" {
-			hasIPv4 := peer.Spec.Address != ""
-			hasIPv6 := peer.Spec.AddressV6 != ""
-
-			switch {
-			case ipv6Only && hasIPv6:
-				allowIps = "::/0"
-			case v6Enabled && hasIPv4 && hasIPv6:
-				allowIps = "0.0.0.0/0, ::/0"
-			case v6Enabled && !hasIPv4 && hasIPv6:
-				allowIps = "::/0"
-			default:
-				allowIps = "0.0.0.0/0"
-			}
+		var allowIps string
+		switch {
+		case ipv6Only && hasIPv6:
+			allowIps = "::/0"
+		case v6Enabled && hasIPv4 && hasIPv6:
+			allowIps = "0.0.0.0/0, ::/0"
+		case v6Enabled && !hasIPv4 && hasIPv6:
+			allowIps = "::/0"
+		default:
+			allowIps = "0.0.0.0/0"
 		}
 
 		// Do not store shell-wrapped config in status anymore per upstream PR 212
@@ -340,6 +346,17 @@ DNS = %s`, strings.TrimSpace(string(v)), addressLine, dnsConfiguration)
 					persistentKeepaliveLine = fmt.Sprintf("\nPersistentKeepalive = %d", *peer.Spec.PersistentKeepalive)
 				}
 
+				// Per-peer preshared key in the client [Peer] block, read from
+				// the same `<name>-peer` Secret that holds the private key (the
+				// convention Secret; field `presharedKey`). The server enforces
+				// this PSK (agent renders it from the same Secret), so a client
+				// config without it gets its handshake silently dropped. Absent
+				// => no line (config byte-identical for non-PSK peers).
+				presharedKeyLine := ""
+				if psk := strings.TrimSpace(string(peerPrivSecret.Data["presharedKey"])); psk != "" {
+					presharedKeyLine = "\nPresharedKey = " + psk
+				}
+
 				if wireguard.Spec.Tunnel.Enabled {
 					tunnelPort := wireguard.Spec.Tunnel.Port
 					if tunnelPort == 0 {
@@ -352,10 +369,10 @@ PreUp = wstunnel client -L udp://127.0.0.1:%d:127.0.0.1:%d wss://%s:%d &
 PostDown = killall wstunnel || true
 
 [Peer]
-PublicKey = %s
+PublicKey = %s%s
 AllowedIPs = %s
 Endpoint = 127.0.0.1:%d%s
-`, port, port, serverAddress, tunnelPort, serverPublicKey, allowIps, port, persistentKeepaliveLine)
+`, port, port, serverAddress, tunnelPort, serverPublicKey, presharedKeyLine, allowIps, port, persistentKeepaliveLine)
 
 					if wireguard.Spec.Tunnel.DualMode {
 						// In dual mode, store both configs:
@@ -364,10 +381,10 @@ Endpoint = 127.0.0.1:%d%s
 						directCfg := pureCfg + fmt.Sprintf(`
 
 [Peer]
-PublicKey = %s
+PublicKey = %s%s
 AllowedIPs = %s
 Endpoint = %s:%s%s
-`, serverPublicKey, allowIps, serverAddress, resources.PeerEndpointPort(wireguard), persistentKeepaliveLine)
+`, serverPublicKey, presharedKeyLine, allowIps, serverAddress, resources.PeerEndpointPort(wireguard), persistentKeepaliveLine)
 						newPeerCfgData[peer.Name] = []byte(directCfg)
 						newPeerCfgData[peer.Name+".tunnel"] = []byte(tunnelCfg)
 					} else {
@@ -378,10 +395,10 @@ Endpoint = %s:%s%s
 					pureCfg = pureCfg + fmt.Sprintf(`
 
 [Peer]
-PublicKey = %s
+PublicKey = %s%s
 AllowedIPs = %s
 Endpoint = %s:%s%s
-`, serverPublicKey, allowIps, serverAddress, resources.PeerEndpointPort(wireguard), persistentKeepaliveLine)
+`, serverPublicKey, presharedKeyLine, allowIps, serverAddress, resources.PeerEndpointPort(wireguard), persistentKeepaliveLine)
 					newPeerCfgData[peer.Name] = []byte(pureCfg)
 				}
 			}
@@ -497,6 +514,18 @@ func (r *WireguardReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 		if peer.Spec.Address == "" {
 			continue
+		}
+
+		// Carry an optional preshared key from the per-peer `<name>-peer` Secret
+		// (the same convention Secret the peer reconciler adopts/creates) into
+		// the agent state, so the server-side [Peer] block emits PresharedKey.
+		// For migrated external peers the PSK is supplied from 1Password via an
+		// ExternalSecret targeting `<name>-peer`. Absent key => no PSK (default).
+		pskSecret := &corev1.Secret{}
+		if err := r.Get(ctx, types.NamespacedName{Name: peer.Name + "-peer", Namespace: peer.Namespace}, pskSecret); err == nil {
+			if v, ok := pskSecret.Data["presharedKey"]; ok {
+				peer.Spec.PresharedKey = strings.TrimSpace(string(v))
+			}
 		}
 
 		filteredPeers = append(filteredPeers, peer)
@@ -707,6 +736,28 @@ func (r *WireguardReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	// secret already created
 	if err == nil {
 		privateKey := string(secret.Data["privateKey"])
+
+		// FAIL CLOSED on a corrupt/mismatched server keypair: if the stored
+		// public key is not the curve25519 derivation of the stored private
+		// key, refuse to reconcile. A wrong server public key would be handed
+		// to every peer's wg-quick config and silently break all handshakes.
+		// (The peer-side provenance/fail-closed logic lives in the
+		// WireguardPeer reconciler; this guards the server's own keypair.)
+		if storedPub := strings.TrimSpace(string(secret.Data["publicKey"])); storedPub != "" {
+			k, perr := wgtypes.ParseKey(strings.TrimSpace(privateKey))
+			if perr != nil {
+				msg := fmt.Sprintf("stored server private key is not a valid WireGuard key: %v", perr)
+				log.Error(perr, msg)
+				_ = r.updateStatus(ctx, req, metav1.Condition{Type: ConditionDegraded, Status: metav1.ConditionTrue, Reason: "ServerKeyInvalid", Message: msg})
+				return ctrl.Result{}, fmt.Errorf("%s", msg)
+			}
+			if derived := k.PublicKey().String(); derived != storedPub {
+				msg := fmt.Sprintf("server public key %s does not match the key %s derived from the stored private key; refusing to reconcile", storedPub, derived)
+				log.Error(fmt.Errorf("server public/private key mismatch"), msg)
+				_ = r.updateStatus(ctx, req, metav1.Condition{Type: ConditionDegraded, Status: metav1.ConditionTrue, Reason: "ServerKeyMismatch", Message: msg})
+				return ctrl.Result{}, fmt.Errorf("%s", msg)
+			}
+		}
 
 		state := agent.State{
 			Server:           *wireguard.DeepCopy(),
