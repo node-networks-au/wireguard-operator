@@ -66,6 +66,24 @@ Concretely:
 `desiredKernelRoutes` → the existing `RouteDel` prune withdraws the kernel route.
 Recovery is the exact reverse, automatically.
 
+### Behaviour-preservation invariants (verified against `noden/main`)
+
+1. **`spec.Disabled` peers are unchanged in *every* mode.** The `Disabled` (and
+   `PublicKey`-less / address-less) skips run **first and independently** —
+   `BuildWgQuickConfig` (`if peer.Spec.Disabled { continue }`, before
+   `peerAllowedIPs`) and `desiredKernelRoutes` (same guard at the top of the loop).
+   The liveness clause is inserted **after** these guards and only *narrows* the
+   routes of peers the existing filter already admits. A `Disabled` peer is fully
+   excluded today and stays fully excluded — liveness can never re-include it nor
+   exclude it differently. (Liveness deliberately does **not** reuse the `Disabled`
+   path: `Disabled` drops the whole peer; not-live drops only routes, keeping the
+   `/32`.)
+2. **`WG_ROUTE_LIVENESS=disabled` is byte-identical to the current branch.** In
+   `disabled` mode `IsLive ≡ true` for all peers, so `peerAllowedIPs` and
+   `desiredKernelRoutes` append every admitted peer's routes exactly as today. The
+   watcher goroutine is not started; `Sync` is driven only by fsnotify + `/health`
+   as now. Default is `disabled`, so an upgrade with no env change is a no-op.
+
 ## Modes — `WG_ROUTE_LIVENESS=disabled|passive|active`
 
 Selected by env (and exposed as the agent's optional liveness arg). The mode picks
@@ -89,19 +107,26 @@ long-lived `wgctrl.Client`. Define **last-progress** = the most recent of
 {a `ReceiveBytes` increase observed by the watcher, `LastHandshakeTime`}.
 
 - **`passive`:** a peer is **live** while `age(last-progress) ≤ downWindow`, where
-  `downWindow = 3 × spec.PersistentKeepalive` for keepalive peers (≈ **75 s** for
-  our 25 s peers — tolerates 2 lost keepalives), falling back to
-  `REJECT_AFTER_TIME = 180 s` for peers with no keepalive configured.
+  **`downWindow` is computed per-peer from that peer's own
+  `spec.PersistentKeepalive`** (`*int32`, read from `state.json`):
+  - keepalive set (`k > 0`): `downWindow = 3 × k` (≈ **75 s** for a 25 s peer —
+    tolerates 2 lost keepalives). Each peer's window scales to its own `k`, so
+    peers with different keepalive intervals get different windows.
+  - keepalive unset/`nil`/`0`: fall back to `REJECT_AFTER_TIME = 180 s`
+    (WireGuard's dead-key point — the only passive signal available without
+    keepalive).
   Rationale: WireGuard handshakes are **traffic-driven** and only refresh
   `LastHandshakeTime` ~every `REKEY_AFTER_TIME` (120 s); `ReceiveBytes` advances on
   **every** inbound packet incl. each keepalive (~25 s), so it detects silence
   ~2.4× sooner with zero added traffic. `age > 180 s` is WireGuard's own dead-key
   point (`REJECT_AFTER_TIME`) — the keepalive-less backstop.
-- **`active`:** as passive, but when last-progress stalls past `2 × keepalive`
-  (~50 s) the agent sends a packet to the peer's **`/32`** (routes via the retained
-  base) to **force a handshake**; if no inbound progress after ~3 × `REKEY_TIMEOUT`
-  (~15 s) the peer is **down** (≈ 50–65 s, with confirmation). The same probe is
-  used to revive a not-live peer with a known endpoint, closing the
+- **`active`:** as passive, but when last-progress stalls past `2 × k` (the
+  **per-peer** keepalive; ~50 s for a 25 s peer) the agent sends a packet to the
+  peer's **`/32`** (routes via the retained base) to **force a handshake**; if no
+  inbound progress after ~3 × `REKEY_TIMEOUT` (~15 s) the peer is **down**
+  (≈ 50–65 s, with confirmation). Keepalive-less peers (no `k`) use the passive
+  180 s path and are only probed for *recovery*, not accelerated down-detection.
+  The same probe revives a not-live peer with a known endpoint, closing the
   keepalive-less recovery deadlock.
 
 A fresh handshake or any inbound progress → **live on the next tick** (≤ 1 s).
