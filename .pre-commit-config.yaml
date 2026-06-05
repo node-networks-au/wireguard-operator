@@ -1,0 +1,21 @@
+# Pre-commit hooks. Mirrors the `lint` job in
+# .github/workflows/pull-request-workflow.yaml so lint failures are caught
+# locally before they reach CI.
+#
+#   pre-commit install      # one-time: wire the git hook
+#   pre-commit run --all-files
+#
+# `language: golang` makes pre-commit fetch and build golangci-lint at the
+# pinned `rev` automatically — no local install required. Keep `rev` in step
+# with the golangci-lint version CI resolves (`version: latest`).
+repos:
+  - repo: https://github.com/golangci/golangci-lint
+    rev: v2.12.2
+    hooks:
+      # Runs `golangci-lint run` over the whole module — the same check CI
+      # runs. (`golangci-lint-full`, not `golangci-lint`, because the latter
+      # only lints changed files and silently skips whole-program linters.)
+      - id: golangci-lint-full
+      # CI's golangci-lint-action also verifies .golangci.yml; do the same so
+      # a broken config is caught at commit time, not in the pipeline.
+      - id: golangci-lint-config-verify
