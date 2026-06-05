@@ -208,11 +208,17 @@ The fragile cases exist **only for keepalive-less peers** — see preconditions.
    < `downWindow`). Our managed client configs already set `PersistentKeepalive =
    25 s`, so compliant peers behave correctly in `passive`. Keepalive-less peers
    need `active` to avoid false-downs/stick. **Documented requirement.**
-2. **(b) Route separability.** Gating keeps the `/32` while dropping routes, so
-   downstream CIDRs **must** arrive via the structured `spec.routes` field (which
-   `peerAllowedIPs` appends to the base), **not** baked into the freeform
-   `spec.allowedIPs` CSV. **Plan step 0: verify the KRO wireguard RGD renders
-   `WireguardPeer.spec.routes` (structured), not an inline `allowedIPs` CSV.**
+2. **(b) Route separability — VERIFIED.** Gating keeps the `/32` while dropping
+   routes, so downstream CIDRs must arrive via the structured `spec.routes` field
+   (which `peerAllowedIPs` appends to the base), not the freeform `spec.allowedIPs`
+   CSV. Confirmed against the KRO RGD
+   (`clusters/noden/configs/services/managed-base/wireguard.yaml`): it emits
+   `allowedIPs = has(peer.allowedIPs) ? peer.allowedIPs : peer.address + "/32"`
+   and `routes = peer.routes`, so `routes:`-based managed peers get
+   `spec.allowedIPs = <addr>/32` (the always-on base) + `spec.routes = [CIDRs]`
+   (the gated set). **Caveat:** a peer that puts downstream CIDRs in the freeform
+   `spec.allowedIPs` CSV is **not** gated (those are treated as base/always-on);
+   gating governs `spec.routes`/`spec.routesV6` only. Documented limitation.
 
 ## Observability
 
