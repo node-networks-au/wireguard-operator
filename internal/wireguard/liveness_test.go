@@ -1,6 +1,29 @@
 package wireguard
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/nccloud/wireguard-operator/api/v1alpha1"
+)
+
+func TestPeerAllowedIPs_NotLiveDropsRoutesKeepsBase(t *testing.T) {
+	peer := v1alpha1.WireguardPeer{Spec: v1alpha1.WireguardPeerSpec{
+		PublicKey: validPeerPublicKey, Address: "172.31.255.11",
+		Routes: []string{"10.254.2.0/24", "192.168.0.0/16"},
+	}}
+	live := peerAllowedIPs(peer, fakeSource{live: map[string]bool{validPeerPublicKey: true}})
+	if live != "172.31.255.11/32,10.254.2.0/24,192.168.0.0/16" {
+		t.Errorf("live peer = %q, want base+routes", live)
+	}
+	down := peerAllowedIPs(peer, fakeSource{live: map[string]bool{validPeerPublicKey: false}})
+	if down != "172.31.255.11/32" {
+		t.Errorf("not-live peer = %q, want base /32 only", down)
+	}
+	none := peerAllowedIPs(peer, nil) // disabled ⇒ all live
+	if none != "172.31.255.11/32,10.254.2.0/24,192.168.0.0/16" {
+		t.Errorf("nil source = %q, want base+routes (unchanged)", none)
+	}
+}
 
 func TestIsLive_NilSourceIsAllLive(t *testing.T) {
 	if !isLive(nil, "anykey") {

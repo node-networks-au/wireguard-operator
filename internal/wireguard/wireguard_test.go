@@ -41,7 +41,7 @@ func TestBuildWgQuickConfig_PreservesMultiCIDRAllowedIPs(t *testing.T) {
 		},
 	}
 
-	cfg, err := BuildWgQuickConfig(state, 51820)
+	cfg, err := BuildWgQuickConfig(state, 51820, nil)
 	if err != nil {
 		t.Fatalf("BuildWgQuickConfig: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestBuildWgQuickConfig_NoSpecAllowedIPs(t *testing.T) {
 		},
 	}
 
-	cfg, err := BuildWgQuickConfig(state, 51820)
+	cfg, err := BuildWgQuickConfig(state, 51820, nil)
 	if err != nil {
 		t.Fatalf("BuildWgQuickConfig: %v", err)
 	}
@@ -94,7 +94,7 @@ func TestBuildWgQuickConfig_InterfaceSection(t *testing.T) {
 		Peers:            nil,
 	}
 
-	cfg, err := BuildWgQuickConfig(state, 51820)
+	cfg, err := BuildWgQuickConfig(state, 51820, nil)
 	if err != nil {
 		t.Fatalf("BuildWgQuickConfig: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestBuildWgQuickConfig_SkipsDisabledAndEmptyKeys(t *testing.T) {
 		},
 	}
 
-	cfg, err := BuildWgQuickConfig(state, 51820)
+	cfg, err := BuildWgQuickConfig(state, 51820, nil)
 	if err != nil {
 		t.Fatalf("BuildWgQuickConfig: %v", err)
 	}
@@ -167,7 +167,7 @@ func TestBuildWgQuickConfig_OmitsPersistentKeepaliveServerSide(t *testing.T) {
 		},
 	}
 
-	cfg, err := BuildWgQuickConfig(state, 51820)
+	cfg, err := BuildWgQuickConfig(state, 51820, nil)
 	if err != nil {
 		t.Fatalf("BuildWgQuickConfig: %v", err)
 	}
@@ -197,7 +197,7 @@ func TestBuildWgQuickConfig_OmitsPersistentKeepaliveWhenUnset(t *testing.T) {
 		},
 	}
 
-	cfg, err := BuildWgQuickConfig(state, 51820)
+	cfg, err := BuildWgQuickConfig(state, 51820, nil)
 	if err != nil {
 		t.Fatalf("BuildWgQuickConfig: %v", err)
 	}
@@ -229,7 +229,7 @@ func TestBuildWgQuickConfig_EmitsPresharedKeyWhenSet(t *testing.T) {
 		},
 	}
 
-	cfg, err := BuildWgQuickConfig(state, 51820)
+	cfg, err := BuildWgQuickConfig(state, 51820, nil)
 	if err != nil {
 		t.Fatalf("BuildWgQuickConfig: %v", err)
 	}
@@ -256,7 +256,7 @@ func TestBuildWgQuickConfig_OmitsPresharedKeyWhenUnset(t *testing.T) {
 		},
 	}
 
-	cfg, err := BuildWgQuickConfig(state, 51820)
+	cfg, err := BuildWgQuickConfig(state, 51820, nil)
 	if err != nil {
 		t.Fatalf("BuildWgQuickConfig: %v", err)
 	}
@@ -288,7 +288,7 @@ func TestBuildWgQuickConfig_RoutesAppendedToAllowedIPs(t *testing.T) {
 		},
 	}
 
-	cfg, err := BuildWgQuickConfig(state, 51820)
+	cfg, err := BuildWgQuickConfig(state, 51820, nil)
 	if err != nil {
 		t.Fatalf("BuildWgQuickConfig: %v", err)
 	}
@@ -317,7 +317,7 @@ func TestBuildWgQuickConfig_RoutesV6AppendedToAllowedIPs(t *testing.T) {
 		},
 	}
 
-	cfg, err := BuildWgQuickConfig(state, 51820)
+	cfg, err := BuildWgQuickConfig(state, 51820, nil)
 	if err != nil {
 		t.Fatalf("BuildWgQuickConfig: %v", err)
 	}
@@ -349,7 +349,7 @@ func TestBuildWgQuickConfig_RoutesAppendedToDefaultAllowedIPs(t *testing.T) {
 		},
 	}
 
-	cfg, err := BuildWgQuickConfig(state, 51820)
+	cfg, err := BuildWgQuickConfig(state, 51820, nil)
 	if err != nil {
 		t.Fatalf("BuildWgQuickConfig: %v", err)
 	}
@@ -381,7 +381,7 @@ func TestBuildWgQuickConfig_EmptyRoutesUnchanged(t *testing.T) {
 		},
 	}
 
-	cfg, err := BuildWgQuickConfig(state, 51820)
+	cfg, err := BuildWgQuickConfig(state, 51820, nil)
 	if err != nil {
 		t.Fatalf("BuildWgQuickConfig: %v", err)
 	}
@@ -409,7 +409,7 @@ func TestBuildWgQuickConfig_TrimsAllowedIPsWhitespace(t *testing.T) {
 		},
 	}
 
-	cfg, err := BuildWgQuickConfig(state, 51820)
+	cfg, err := BuildWgQuickConfig(state, 51820, nil)
 	if err != nil {
 		t.Fatalf("BuildWgQuickConfig: %v", err)
 	}

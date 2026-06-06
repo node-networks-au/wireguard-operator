@@ -214,7 +214,7 @@ func SyncLink(_ agent.State, iface string, wgUserspaceImplementationFallback str
 // ops added via `WireguardPeer.spec.allowedIPs`. `wg syncconf` honours the
 // supplied AllowedIPs CSV verbatim and only diffs peers that actually changed.
 func (wg *Wireguard) syncWireguard(state agent.State, iface string, listenPort int) error {
-	cfg, err := BuildWgQuickConfig(state, listenPort)
+	cfg, err := BuildWgQuickConfig(state, listenPort, nil)
 	if err != nil {
 		return err
 	}
@@ -530,7 +530,7 @@ func gatewayIPFromPrefix(prefix netip.Prefix) (*net.IPNet, net.IP, error) {
 // responsible for, and the operator will splice them into the [Peer].AllowedIPs
 // the server enforces. Empty/unset Routes preserves the Phase E/F output
 // verbatim (no trailing comma, no extra CIDRs).
-func peerAllowedIPs(peer v1alpha1.WireguardPeer) string {
+func peerAllowedIPs(peer v1alpha1.WireguardPeer, src LivenessSource) string {
 	var out []string
 
 	if peer.Spec.AllowedIPs != "" {
@@ -548,14 +548,20 @@ func peerAllowedIPs(peer v1alpha1.WireguardPeer) string {
 		}
 	}
 
-	for _, r := range peer.Spec.Routes {
-		if r = strings.TrimSpace(r); r != "" {
-			out = append(out, r)
+	// Liveness gate: spec.routes / spec.routesV6 are the downstream CIDRs and are
+	// installed only while the peer is live. The base (above) is always kept so
+	// the peer can still handshake and recover. A not-live peer is treated like a
+	// Disabled peer FOR ROUTES ONLY. nil src ⇒ all-live (disabled mode, unchanged).
+	if isLive(src, peer.Spec.PublicKey) {
+		for _, r := range peer.Spec.Routes {
+			if r = strings.TrimSpace(r); r != "" {
+				out = append(out, r)
+			}
 		}
-	}
-	for _, r := range peer.Spec.RoutesV6 {
-		if r = strings.TrimSpace(r); r != "" {
-			out = append(out, r)
+		for _, r := range peer.Spec.RoutesV6 {
+			if r = strings.TrimSpace(r); r != "" {
+				out = append(out, r)
+			}
 		}
 	}
 
@@ -577,7 +583,7 @@ func peerAllowedIPs(peer v1alpha1.WireguardPeer) string {
 // [Peer] list as a diff: peers absent from the config are removed, peers
 // present are added/updated with their exact AllowedIPs CSV. This eliminates
 // the multi-CIDR truncation bug that Phase E fixes.
-func BuildWgQuickConfig(state agent.State, listenPort int) (string, error) {
+func BuildWgQuickConfig(state agent.State, listenPort int, src LivenessSource) (string, error) {
 	if state.ServerPrivateKey == "" {
 		return "", fmt.Errorf("server private key is empty")
 	}
@@ -596,7 +602,7 @@ func BuildWgQuickConfig(state agent.State, listenPort int) (string, error) {
 			continue
 		}
 
-		allowed := peerAllowedIPs(peer)
+		allowed := peerAllowedIPs(peer, src)
 		if allowed == "" {
 			continue
 		}
