@@ -107,9 +107,12 @@ func main() {
 		Logger: log.WithName("iptables"),
 	}
 
-	// Liveness-gated routes. Off by default → nil controller → wg.Liveness nil →
-	// byte-identical to current behavior. When enabled, the watcher re-applies
-	// wg.Sync of the latest state on a peer up/down transition.
+	// Liveness-gated routes. cfg.Mode is the CLUSTER DEFAULT (WG_ROUTE_LIVENESS,
+	// default disabled); per-instance (Wireguard.spec.routeLiveness) and per-peer
+	// (WireguardPeer.spec.routeLiveness) override it. The watcher always runs so
+	// per-tenant/per-peer opt-in takes effect even when the cluster default is
+	// disabled; when every peer resolves to disabled it's a cheap no-op read loop
+	// (IsLive ⇒ true ⇒ routes static, byte-identical to current behavior).
 	livenessCfg := wireguard.Config{
 		Mode:          wireguard.ParseMode(os.Getenv("WG_ROUTE_LIVENESS")),
 		FailureCount:  envInt("WG_ROUTE_FAILURE_COUNT", 3),
@@ -126,20 +129,16 @@ func main() {
 		stateMu.Unlock()
 		return wg.Sync(s)
 	}
+	reader, rerr := wireguard.NewDeviceReader(iface)
 	var routeController *wireguard.LivenessController
-	if livenessCfg.Mode != wireguard.ModeDisabled {
-		reader, rerr := wireguard.NewDeviceReader(iface)
-		if rerr != nil {
-			log.Error(rerr, "liveness: failed to open wgctrl reader; route gating disabled")
-		} else {
-			routeController = wireguard.BuildController(livenessCfg, reader, log.WithName("liveness"))
-		}
-	}
-	if routeController != nil {
+	if rerr != nil {
+		log.Error(rerr, "liveness: wgctrl reader unavailable; route gating disabled (routes static)")
+	} else {
+		routeController = wireguard.BuildController(livenessCfg, reader, log.WithName("liveness"))
 		wg.Liveness = routeController
 		routeController.SetApply(applyLatest)
-		log.Info("liveness-gated routes enabled",
-			"mode", string(livenessCfg.Mode), "failureCount", livenessCfg.FailureCount,
+		log.Info("liveness controller started",
+			"clusterDefault", string(livenessCfg.Mode), "failureCount", livenessCfg.FailureCount,
 			"checkInterval", livenessCfg.CheckInterval.String(), "probeInterval", livenessCfg.ProbeInterval.String())
 	}
 
@@ -149,7 +148,7 @@ func main() {
 		latestState = state
 		stateMu.Unlock()
 		if routeController != nil {
-			routeController.SetPeers(wireguard.PeerInfos(state))
+			routeController.SetPeers(wireguard.InstanceMode(state), wireguard.PeerInfos(state))
 		}
 		// Update metrics mapping for peer_name label
 		agent.UpdatePeerNameMapping(state.Peers)
