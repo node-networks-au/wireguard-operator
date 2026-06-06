@@ -103,6 +103,7 @@ func (w *wgctrlReader) Close() error { return w.client.Close() }
 type progress struct {
 	lastRX      int64
 	lastAdvance time.Time // most recent of {observed RX increase, handshake time}
+	seenRX      bool      // first observe has recorded an RX baseline for this peer
 }
 
 // passiveLiveness derives liveness from counters in the wgctrl device read with
@@ -149,7 +150,13 @@ func (p *passiveLiveness) observe(stats []peerStat) {
 	defer p.mu.Unlock()
 	for _, s := range stats {
 		pr := p.seen[s.PublicKey]
-		if s.ReceiveBytes > pr.lastRX {
+		if !pr.seenRX {
+			// First sight: record the baseline only. A nonzero counter here is a
+			// pre-existing value (agent restarted against a live wg0), not fresh
+			// traffic, so it must NOT seed lastAdvance — gated peers start dead.
+			pr.lastRX = s.ReceiveBytes
+			pr.seenRX = true
+		} else if s.ReceiveBytes > pr.lastRX {
 			pr.lastRX = s.ReceiveBytes
 			pr.lastAdvance = now
 		}
@@ -352,6 +359,7 @@ type activeLiveness struct {
 	failed    map[string]int
 	lastProbe map[string]time.Time
 	addr      map[string]string
+	confirmed map[string]bool // peer has shown >=1 positive reachability signal
 }
 
 func newActiveLiveness(passive *passiveLiveness, failures int, probeEvery time.Duration, now func() time.Time, pr prober) *activeLiveness {
@@ -364,6 +372,7 @@ func newActiveLiveness(passive *passiveLiveness, failures int, probeEvery time.D
 	return &activeLiveness{
 		passive: passive, prober: pr, failures: failures, probeEvery: probeEvery, now: now,
 		failed: map[string]int{}, lastProbe: map[string]time.Time{}, addr: map[string]string{},
+		confirmed: map[string]bool{},
 	}
 }
 
@@ -389,7 +398,16 @@ func (a *activeLiveness) probePass(stats []peerStat) {
 		if !isActive || addr == "" {
 			continue
 		}
-		// Fresh progress within a probe interval ⇒ healthy, reset failures.
+		// Passive-live (handshake / inbound progress within its window) ⇒ confirm
+		// reachability: this is what lets a peer leave its start-dead state, and
+		// it fires on the very first tick for a genuinely-connected peer (the
+		// handshake age is absolute). An active peer is never live until proven
+		// reachable this way or by a probe response.
+		if a.passive.IsLive(pk) {
+			a.confirmed[pk] = true
+		}
+		// Fresh progress within a probe interval ⇒ healthy, reset failures and
+		// don't probe.
 		if a.passive.freshWithin(pk, a.probeEvery) {
 			a.failed[pk] = 0
 			continue
@@ -406,7 +424,11 @@ func (a *activeLiveness) probePass(stats []peerStat) {
 func (a *activeLiveness) IsLive(publicKey string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.failed[publicKey] < a.failures
+	// Start dead: an active peer is live only once a probe pass has positively
+	// confirmed reachability (fresh handshake / inbound progress) AND it has not
+	// since exhausted its consecutive-unanswered-probe budget. This prevents a
+	// down peer from holding its downstream routes through the initial window.
+	return a.confirmed[publicKey] && a.failed[publicKey] < a.failures
 }
 
 // Config holds the env-derived liveness knobs.
