@@ -23,6 +23,67 @@ type fakeReader struct {
 
 func (f fakeReader) readPeers() ([]peerStat, error) { return f.peers, f.err }
 
+func ts(sec int64) time.Time { return time.Unix(sec, 0) }
+
+func TestPassive_NeverActiveIsNotLive(t *testing.T) {
+	clk := ts(1000)
+	p := newPassiveLiveness(3, func() time.Time { return clk })
+	p.setKeepalive("k", 25*time.Second)
+	p.observe([]peerStat{{PublicKey: "k", ReceiveBytes: 0}}) // never any progress
+	if p.IsLive("k") {
+		t.Fatal("never-active peer must be not-live")
+	}
+}
+
+func TestPassive_LiveWhileReceiveBytesAdvance(t *testing.T) {
+	clk := ts(1000)
+	p := newPassiveLiveness(3, func() time.Time { return clk })
+	p.setKeepalive("k", 25*time.Second) // downWindow = 75s
+	p.observe([]peerStat{{PublicKey: "k", ReceiveBytes: 100}})
+	clk = ts(1050) // 50s later, still within 75s
+	if !p.IsLive("k") {
+		t.Fatal("peer within downWindow must be live")
+	}
+}
+
+func TestPassive_DownAfterNKeepalivesMissed(t *testing.T) {
+	clk := ts(1000)
+	p := newPassiveLiveness(3, func() time.Time { return clk })
+	p.setKeepalive("k", 25*time.Second) // downWindow = 75s
+	p.observe([]peerStat{{PublicKey: "k", ReceiveBytes: 100}})
+	clk = ts(1076) // 76s later, > 75s, no new bytes
+	p.observe([]peerStat{{PublicKey: "k", ReceiveBytes: 100}})
+	if p.IsLive("k") {
+		t.Fatal("peer silent > N*keepalive must be not-live")
+	}
+}
+
+func TestPassive_KeepaliveLessFallsBackTo180s(t *testing.T) {
+	clk := ts(1000)
+	p := newPassiveLiveness(3, func() time.Time { return clk })
+	// no setKeepalive ⇒ 180s fallback
+	p.observe([]peerStat{{PublicKey: "k", ReceiveBytes: 100}})
+	clk = ts(1170) // 170s < 180s
+	if !p.IsLive("k") {
+		t.Fatal("keepalive-less peer within 180s must be live")
+	}
+	clk = ts(1181) // 181s > 180s
+	if p.IsLive("k") {
+		t.Fatal("keepalive-less peer past 180s must be not-live")
+	}
+}
+
+func TestPassive_HandshakeCountsAsProgress(t *testing.T) {
+	clk := ts(2000)
+	p := newPassiveLiveness(3, func() time.Time { return clk })
+	p.setKeepalive("k", 25*time.Second)
+	// no RX increase, but a fresh handshake at t=1990
+	p.observe([]peerStat{{PublicKey: "k", ReceiveBytes: 0, LastHandshakeTime: ts(1990)}})
+	if !p.IsLive("k") {
+		t.Fatal("recent handshake must keep peer live even without RX delta")
+	}
+}
+
 func TestWireguard_LivenessFieldDefaultsNil(t *testing.T) {
 	wg := Wireguard{}
 	if wg.Liveness != nil {

@@ -2,6 +2,7 @@ package wireguard
 
 import (
 	"strings"
+	"sync"
 	"time"
 
 	"golang.zx2c4.com/wireguard/wgctrl"
@@ -93,3 +94,92 @@ func (w *wgctrlReader) readPeers() ([]peerStat, error) {
 }
 
 func (w *wgctrlReader) Close() error { return w.client.Close() }
+
+type progress struct {
+	lastRX      int64
+	lastAdvance time.Time // most recent of {observed RX increase, handshake time}
+}
+
+// passiveLiveness derives liveness from counters in the wgctrl device read with
+// zero added traffic: a peer is live while its last-progress age is within a
+// per-peer window (N × keepalive, or REJECT_AFTER_TIME when no keepalive).
+type passiveLiveness struct {
+	mu        sync.Mutex
+	seen      map[string]progress
+	keepalive map[string]time.Duration // per-peer, from spec.PersistentKeepalive
+	failures  int                      // N (WG_ROUTE_FAILURE_COUNT)
+	now       func() time.Time
+}
+
+func newPassiveLiveness(failures int, now func() time.Time) *passiveLiveness {
+	if failures < 1 {
+		failures = 1
+	}
+	if now == nil {
+		now = time.Now
+	}
+	return &passiveLiveness{
+		seen:      map[string]progress{},
+		keepalive: map[string]time.Duration{},
+		failures:  failures,
+		now:       now,
+	}
+}
+
+// setKeepalive records a peer's keepalive interval (0/absent ⇒ 180s fallback).
+func (p *passiveLiveness) setKeepalive(publicKey string, k time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if k > 0 {
+		p.keepalive[publicKey] = k
+	} else {
+		delete(p.keepalive, publicKey)
+	}
+}
+
+// observe folds a device snapshot into per-peer last-progress.
+func (p *passiveLiveness) observe(stats []peerStat) {
+	now := p.now()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, s := range stats {
+		pr := p.seen[s.PublicKey]
+		if s.ReceiveBytes > pr.lastRX {
+			pr.lastRX = s.ReceiveBytes
+			pr.lastAdvance = now
+		}
+		if s.LastHandshakeTime.After(pr.lastAdvance) {
+			pr.lastAdvance = s.LastHandshakeTime
+		}
+		p.seen[s.PublicKey] = pr
+	}
+}
+
+// downWindow is the per-peer staleness threshold. Caller must hold p.mu.
+func (p *passiveLiveness) downWindow(publicKey string) time.Duration {
+	if k, ok := p.keepalive[publicKey]; ok && k > 0 {
+		return time.Duration(p.failures) * k
+	}
+	return rejectAfterTime * time.Second
+}
+
+// freshWithin reports whether the peer showed progress within d (used by active).
+func (p *passiveLiveness) freshWithin(publicKey string, d time.Duration) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	pr, ok := p.seen[publicKey]
+	if !ok || pr.lastAdvance.IsZero() {
+		return false
+	}
+	return p.now().Sub(pr.lastAdvance) <= d
+}
+
+func (p *passiveLiveness) IsLive(publicKey string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	pr, ok := p.seen[publicKey]
+	if !ok || pr.lastAdvance.IsZero() {
+		return false
+	}
+	return p.now().Sub(pr.lastAdvance) <= p.downWindow(publicKey)
+}
