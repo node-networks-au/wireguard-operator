@@ -192,47 +192,102 @@ func (p *passiveLiveness) IsLive(publicKey string) bool {
 }
 
 // observer is the subset of a liveness source the controller drives each tick.
-type observer interface {
-	LivenessSource
-	observe([]peerStat)
+// explicitMode parses a CRD routeLiveness value. ok=false for "" / unrecognised
+// (meaning "inherit"); an explicit "disabled" returns (ModeDisabled, true) so it
+// overrides a passive/active level above it in the cascade.
+func explicitMode(s string) (Mode, bool) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case string(ModeDisabled):
+		return ModeDisabled, true
+	case string(ModePassive):
+		return ModePassive, true
+	case string(ModeActive):
+		return ModeActive, true
+	default:
+		return ModeDisabled, false
+	}
 }
 
-// LivenessController owns the watcher goroutine. It reads the device on a timer,
-// folds it into the source, and calls apply() only when a peer's live state
-// transitions. It also IS the LivenessSource handed to the Wireguard struct.
+// resolveMode applies the cascade: per-peer > per-instance > cluster default.
+func resolveMode(peerMode, instanceMode string, clusterDefault Mode) Mode {
+	if m, ok := explicitMode(peerMode); ok {
+		return m
+	}
+	if m, ok := explicitMode(instanceMode); ok {
+		return m
+	}
+	return clusterDefault
+}
+
+// LivenessController owns the watcher goroutine and IS the LivenessSource handed
+// to the Wireguard struct. It resolves a per-peer effective mode (peer > instance
+// > cluster default), tracks every peer passively, probes only active-mode peers,
+// and calls apply() only when a GATED peer's live state transitions.
 type LivenessController struct {
-	source        observer
-	reader        deviceReader
-	apply         func() error // wired to wg.Sync(latestState)
-	checkInterval time.Duration
-	logger        logr.Logger
+	passive        *passiveLiveness
+	active         *activeLiveness
+	reader         deviceReader
+	apply          func() error // wired to wg.Sync(latestState)
+	checkInterval  time.Duration
+	clusterDefault Mode
+	logger         logr.Logger
 
 	mu     sync.Mutex
-	lastUp map[string]bool // pubkey -> last observed live state
+	mode   map[string]Mode // effective mode per pubkey (resolved in SetPeers)
+	lastUp map[string]bool // pubkey -> last observed live state (gated peers only)
 
 	// setGauge, if set, is called on every transition with 1 (live) / 0 (down).
 	setGauge func(publicKey string, value float64)
 }
 
-func (c *LivenessController) IsLive(publicKey string) bool { return c.source.IsLive(publicKey) }
+// modeFor returns a peer's effective mode (cluster default if not yet resolved).
+func (c *LivenessController) modeFor(publicKey string) Mode {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if m, ok := c.mode[publicKey]; ok {
+		return m
+	}
+	return c.clusterDefault
+}
 
-// tickOnce performs one read+observe+transition-detect, calling apply() iff a
-// peer's live state changed this tick.
+// IsLive branches on the peer's effective mode: disabled ⇒ always live (ungated,
+// routes static), passive ⇒ stall signal, active ⇒ stall + probe.
+func (c *LivenessController) IsLive(publicKey string) bool {
+	switch c.modeFor(publicKey) {
+	case ModePassive:
+		return c.passive.IsLive(publicKey)
+	case ModeActive:
+		return c.active.IsLive(publicKey)
+	default: // ModeDisabled / unknown ⇒ ungated
+		return true
+	}
+}
+
+// tickOnce reads the device, folds it into the passive tracker, runs the active
+// probe pass, and calls apply() iff a GATED peer's live state changed this tick.
 func (c *LivenessController) tickOnce() {
 	stats, err := c.reader.readPeers()
 	if err != nil {
 		c.logger.Error(err, "liveness read failed")
 		return
 	}
-	c.source.observe(stats)
+	c.passive.observe(stats)
+	c.active.probePass(stats)
 	changed := false
 	c.mu.Lock()
 	for _, s := range stats {
-		up := c.source.IsLive(s.PublicKey)
+		// Only gated peers participate — a disabled peer's routes are static so
+		// there is nothing to (un)install on a transition.
+		mode := c.mode[s.PublicKey]
+		if mode != ModePassive && mode != ModeActive {
+			continue
+		}
+		up := mode == ModePassive && c.passive.IsLive(s.PublicKey) ||
+			mode == ModeActive && c.active.IsLive(s.PublicKey)
 		if prev, ok := c.lastUp[s.PublicKey]; !ok || prev != up {
 			c.lastUp[s.PublicKey] = up
 			changed = true
-			c.logger.V(1).Info("peer liveness transition", "peer", s.PublicKey, "live", up)
+			c.logger.V(1).Info("peer liveness transition", "peer", s.PublicKey, "mode", string(mode), "live", up)
 			if c.setGauge != nil {
 				v := 0.0
 				if up {
@@ -320,16 +375,20 @@ func (a *activeLiveness) setAddr(publicKey, addr string) {
 	}
 }
 
-// observe satisfies observer; it folds into passive then runs a probe pass.
-func (a *activeLiveness) observe(stats []peerStat) { a.tick(stats) }
-
-func (a *activeLiveness) tick(stats []peerStat) {
-	a.passive.observe(stats)
+// probePass probes quiet ACTIVE-mode peers (those with a registered addr) and
+// tracks consecutive unanswered probes. The controller calls passive.observe
+// separately, so this does NOT re-observe. Peers without a registered addr
+// (i.e. not effective-active) are skipped entirely.
+func (a *activeLiveness) probePass(stats []peerStat) {
 	now := a.now()
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	for _, s := range stats {
 		pk := s.PublicKey
+		addr, isActive := a.addr[pk]
+		if !isActive || addr == "" {
+			continue
+		}
 		// Fresh progress within a probe interval ⇒ healthy, reset failures.
 		if a.passive.freshWithin(pk, a.probeEvery) {
 			a.failed[pk] = 0
@@ -337,9 +396,7 @@ func (a *activeLiveness) tick(stats []peerStat) {
 		}
 		// Quiet: probe if due, count this probe as failed until progress proves it.
 		if now.Sub(a.lastProbe[pk]) >= a.probeEvery {
-			if addr := a.addr[pk]; addr != "" {
-				a.prober.probe(addr)
-			}
+			a.prober.probe(addr)
 			a.lastProbe[pk] = now
 			a.failed[pk]++
 		}
@@ -360,26 +417,25 @@ type Config struct {
 	ProbeInterval time.Duration // active probe cadence (WG_ROUTE_PROBE_INTERVAL)
 }
 
-// BuildController returns a configured controller, or nil for disabled mode.
-// The caller wires c.SetApply and starts c.Run; for disabled mode it leaves
-// Wireguard.Liveness nil (all-live, current behavior).
+// BuildController always returns a controller (never nil): per-peer / per-instance
+// routeLiveness can enable gating even when the cluster default is disabled, so
+// the watcher must run regardless. When every peer resolves to disabled it is a
+// cheap no-op read loop (IsLive ⇒ true ⇒ routes static). cfg.Mode is the cluster
+// default. The caller wires SetApply, feeds SetPeers, and starts Run.
 func BuildController(cfg Config, reader deviceReader, logger logr.Logger) *LivenessController {
-	if cfg.Mode == ModeDisabled {
-		return nil
-	}
 	passive := newPassiveLiveness(cfg.FailureCount, time.Now)
-	var src observer = passive
-	if cfg.Mode == ModeActive {
-		src = newActiveLiveness(passive, cfg.FailureCount, cfg.ProbeInterval, time.Now, udpProber{})
-	}
+	active := newActiveLiveness(passive, cfg.FailureCount, cfg.ProbeInterval, time.Now, udpProber{})
 	gauge := routesActiveGauge()
 	return &LivenessController{
-		source:        src,
-		reader:        reader,
-		checkInterval: cfg.CheckInterval,
-		logger:        logger,
-		lastUp:        map[string]bool{},
-		setGauge:      func(pk string, v float64) { gauge.WithLabelValues(pk).Set(v) },
+		passive:        passive,
+		active:         active,
+		reader:         reader,
+		checkInterval:  cfg.CheckInterval,
+		clusterDefault: cfg.Mode,
+		logger:         logger,
+		mode:           map[string]Mode{},
+		lastUp:         map[string]bool{},
+		setGauge:       func(pk string, v float64) { gauge.WithLabelValues(pk).Set(v) },
 	}
 }
 
@@ -388,20 +444,22 @@ type peerInfo struct {
 	PublicKey string
 	Keepalive time.Duration
 	Address   string
+	Mode      string // explicit per-peer routeLiveness ("" = inherit)
 }
 
-// SetPeers feeds per-peer keepalive + (active) tunnel addresses from the latest
-// state so windows and probe targets track config. Safe on every state change.
-func (c *LivenessController) SetPeers(peers []peerInfo) {
-	switch s := c.source.(type) {
-	case *passiveLiveness:
-		for _, p := range peers {
-			s.setKeepalive(p.PublicKey, p.Keepalive)
-		}
-	case *activeLiveness:
-		for _, p := range peers {
-			s.passive.setKeepalive(p.PublicKey, p.Keepalive)
-			s.setAddr(p.PublicKey, p.Address)
+// SetPeers resolves each peer's effective mode (peer > instance > cluster default)
+// and feeds keepalive (all peers) + probe addresses (active-mode peers only).
+// Safe on every state change.
+func (c *LivenessController) SetPeers(instanceMode string, peers []peerInfo) {
+	c.mu.Lock()
+	for _, p := range peers {
+		c.mode[p.PublicKey] = resolveMode(p.Mode, instanceMode, c.clusterDefault)
+	}
+	c.mu.Unlock()
+	for _, p := range peers {
+		c.passive.setKeepalive(p.PublicKey, p.Keepalive)
+		if c.modeFor(p.PublicKey) == ModeActive {
+			c.active.setAddr(p.PublicKey, p.Address)
 		}
 	}
 }
@@ -412,6 +470,9 @@ func (c *LivenessController) SetApply(fn func() error) { c.apply = fn }
 // NewDeviceReader returns the production wgctrl-backed reader (exported for main).
 func NewDeviceReader(iface string) (deviceReader, error) { return newWgctrlReader(iface) }
 
+// InstanceMode returns the instance-level routeLiveness from the server CR.
+func InstanceMode(state agent.State) string { return state.Server.Spec.RouteLiveness }
+
 // PeerInfos extracts the controller's per-peer config from agent state.
 func PeerInfos(state agent.State) []peerInfo {
 	out := make([]peerInfo, 0, len(state.Peers))
@@ -420,7 +481,7 @@ func PeerInfos(state agent.State) []peerInfo {
 		if p.Spec.PersistentKeepalive != nil && *p.Spec.PersistentKeepalive > 0 {
 			k = time.Duration(*p.Spec.PersistentKeepalive) * time.Second
 		}
-		out = append(out, peerInfo{PublicKey: p.Spec.PublicKey, Keepalive: k, Address: p.Spec.Address})
+		out = append(out, peerInfo{PublicKey: p.Spec.PublicKey, Keepalive: k, Address: p.Spec.Address, Mode: p.Spec.RouteLiveness})
 	}
 	return out
 }

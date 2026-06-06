@@ -9,19 +9,65 @@ import (
 	"github.com/nccloud/wireguard-operator/api/v1alpha1"
 )
 
-func TestBuildController_DisabledReturnsNil(t *testing.T) {
-	c := BuildController(Config{Mode: ModeDisabled}, nil, logr.Discard())
-	if c != nil {
-		t.Fatal("disabled mode must yield a nil controller (no watcher, nil Liveness)")
+func TestBuildController_AlwaysBuiltAndClusterDefaultUngated(t *testing.T) {
+	// Always non-nil now: per-peer/per-instance can enable even when the cluster
+	// default is disabled, so the watcher must run regardless.
+	for _, m := range []Mode{ModeDisabled, ModePassive, ModeActive} {
+		c := BuildController(Config{Mode: m, FailureCount: 3, CheckInterval: time.Second, ProbeInterval: 15 * time.Second}, fakeReader{}, logr.Discard())
+		if c == nil {
+			t.Fatalf("cluster default %q must still yield a controller", m)
+		}
+	}
+	// With cluster default disabled, an unresolved peer is ungated (always live).
+	c := BuildController(Config{Mode: ModeDisabled, FailureCount: 3, CheckInterval: time.Second, ProbeInterval: 15 * time.Second}, fakeReader{}, logr.Discard())
+	if !c.IsLive("unknown") {
+		t.Fatal("cluster-default-disabled peer must be ungated (always live)")
 	}
 }
 
-func TestBuildController_PassiveAndActiveNonNil(t *testing.T) {
-	for _, m := range []Mode{ModePassive, ModeActive} {
-		c := BuildController(Config{Mode: m, FailureCount: 3, CheckInterval: time.Second, ProbeInterval: 15 * time.Second}, fakeReader{}, logr.Discard())
-		if c == nil {
-			t.Fatalf("mode %q must yield a controller", m)
+func TestResolveMode_Cascade(t *testing.T) {
+	cases := []struct {
+		peer, inst string
+		def        Mode
+		want       Mode
+	}{
+		{"", "", ModeDisabled, ModeDisabled},              // nothing set ⇒ default
+		{"", "", ModePassive, ModePassive},                // cluster default applies
+		{"", "active", ModeDisabled, ModeActive},          // instance overrides default
+		{"passive", "active", ModeDisabled, ModePassive},  // peer overrides instance
+		{"disabled", "active", ModePassive, ModeDisabled}, // explicit disabled overrides downward
+		{"bogus", "", ModePassive, ModePassive},           // unrecognised peer ⇒ inherit
+	}
+	for _, tc := range cases {
+		if got := resolveMode(tc.peer, tc.inst, tc.def); got != tc.want {
+			t.Errorf("resolveMode(%q,%q,%q)=%q want %q", tc.peer, tc.inst, tc.def, got, tc.want)
 		}
+	}
+}
+
+func TestController_PerPeerModeResolution(t *testing.T) {
+	clk := ts(1000)
+	pass := newPassiveLiveness(3, func() time.Time { return clk })
+	c := &LivenessController{
+		passive:        pass,
+		active:         newActiveLiveness(pass, 3, 15*time.Second, func() time.Time { return clk }, proberFunc(func(string) {})),
+		clusterDefault: ModeDisabled,
+		mode:           map[string]Mode{},
+		lastUp:         map[string]bool{},
+	}
+	// instance=active; DC1 explicitly disabled (fallback); DC2 inherits active.
+	c.SetPeers("active", []peerInfo{
+		{PublicKey: "dc1", Mode: "disabled", Keepalive: 25 * time.Second, Address: "172.31.255.11"},
+		{PublicKey: "dc2", Mode: "", Keepalive: 25 * time.Second, Address: "172.31.255.12"},
+	})
+	if c.modeFor("dc1") != ModeDisabled {
+		t.Errorf("dc1 explicit disabled, got %s", c.modeFor("dc1"))
+	}
+	if c.modeFor("dc2") != ModeActive {
+		t.Errorf("dc2 should inherit instance active, got %s", c.modeFor("dc2"))
+	}
+	if !c.IsLive("dc1") {
+		t.Error("dc1 (disabled) must be ungated / always live")
 	}
 }
 
@@ -50,9 +96,11 @@ func TestController_SetsRoutesActiveGauge(t *testing.T) {
 	var lastPK string
 	var lastVal float64
 	c := &LivenessController{
-		source:   pass,
+		passive:  pass,
+		active:   newActiveLiveness(pass, 3, 15*time.Second, func() time.Time { return clk }, proberFunc(func(string) {})),
 		reader:   fakeReader{peers: []peerStat{{PublicKey: "k", ReceiveBytes: 100}}},
 		apply:    func() error { return nil },
+		mode:     map[string]Mode{"k": ModePassive},
 		lastUp:   map[string]bool{},
 		setGauge: func(pk string, v float64) { lastPK = pk; lastVal = v },
 	}
@@ -73,10 +121,12 @@ func TestActive_DownAfterNUnansweredProbes(t *testing.T) {
 	if !a.IsLive("k") {
 		t.Fatal("starts live")
 	}
-	// advance past window with no progress; each probe interval => one failed probe
+	// advance past window with no progress; each probe interval => one failed probe.
+	// Mirror the controller: observe (no RX change) then probePass.
 	for i := 1; i <= 3; i++ {
 		clk = ts(1000 + int64(i)*15)
-		a.tick([]peerStat{{PublicKey: "k", ReceiveBytes: 100}})
+		pass.observe([]peerStat{{PublicKey: "k", ReceiveBytes: 100}})
+		a.probePass([]peerStat{{PublicKey: "k", ReceiveBytes: 100}})
 	}
 	if probes < 3 {
 		t.Fatalf("expected >=3 probes, got %d", probes)
@@ -94,9 +144,11 @@ func TestActive_ProbeResponseRevives(t *testing.T) {
 	a := newActiveLiveness(pass, 3, 15*time.Second, func() time.Time { return clk }, proberFunc(func(string) {}))
 	a.setAddr("k", "172.31.255.11")
 	clk = ts(1016)
-	a.tick([]peerStat{{PublicKey: "k", ReceiveBytes: 100}}) // 1 failed probe
+	pass.observe([]peerStat{{PublicKey: "k", ReceiveBytes: 100}})
+	a.probePass([]peerStat{{PublicKey: "k", ReceiveBytes: 100}}) // 1 failed probe
 	clk = ts(1031)
-	a.tick([]peerStat{{PublicKey: "k", ReceiveBytes: 200}}) // RX advanced ⇒ revive
+	pass.observe([]peerStat{{PublicKey: "k", ReceiveBytes: 200}}) // RX advanced
+	a.probePass([]peerStat{{PublicKey: "k", ReceiveBytes: 200}})  // fresh ⇒ revive
 	if !a.IsLive("k") {
 		t.Fatal("inbound progress must reset failure count and keep peer live")
 	}
@@ -112,10 +164,12 @@ func TestController_AppliesOnlyOnTransition(t *testing.T) {
 	pass.setKeepalive("k", 25*time.Second)
 	applied := 0
 	c := &LivenessController{
-		source: pass,
-		reader: fakeReader{peers: []peerStat{{PublicKey: "k", ReceiveBytes: 100}}},
-		apply:  func() error { applied++; return nil },
-		lastUp: map[string]bool{},
+		passive: pass,
+		active:  newActiveLiveness(pass, 3, 15*time.Second, func() time.Time { return clk }, proberFunc(func(string) {})),
+		reader:  fakeReader{peers: []peerStat{{PublicKey: "k", ReceiveBytes: 100}}},
+		apply:   func() error { applied++; return nil },
+		mode:    map[string]Mode{"k": ModePassive},
+		lastUp:  map[string]bool{},
 	}
 	c.tickOnce() // first observation: k transitions absent->live
 	if applied != 1 {
@@ -126,7 +180,6 @@ func TestController_AppliesOnlyOnTransition(t *testing.T) {
 		t.Fatalf("quiet tick must not apply, got %d", applied)
 	}
 	clk = ts(1100) // 100s later, > 75s window, no new bytes
-	c.reader = fakeReader{peers: []peerStat{{PublicKey: "k", ReceiveBytes: 100}}}
 	c.tickOnce() // live->not-live transition
 	if applied != 2 {
 		t.Fatalf("expected apply on down-transition, got %d", applied)
