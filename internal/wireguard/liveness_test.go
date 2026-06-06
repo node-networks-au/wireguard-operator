@@ -98,13 +98,13 @@ func TestController_SetsRoutesActiveGauge(t *testing.T) {
 	c := &LivenessController{
 		passive:  pass,
 		active:   newActiveLiveness(pass, 3, 15*time.Second, func() time.Time { return clk }, proberFunc(func(string) {})),
-		reader:   fakeReader{peers: []peerStat{{PublicKey: "k", ReceiveBytes: 100}}},
+		reader:   fakeReader{peers: []peerStat{{PublicKey: "k", ReceiveBytes: 100, LastHandshakeTime: ts(990)}}},
 		apply:    func() error { return nil },
 		mode:     map[string]Mode{"k": ModePassive},
 		lastUp:   map[string]bool{},
 		setGauge: func(pk string, v float64) { lastPK = pk; lastVal = v },
 	}
-	c.tickOnce()
+	c.tickOnce() // fresh handshake (absolute) ⇒ live on the first tick
 	if lastPK != "k" || lastVal != 1 {
 		t.Fatalf("gauge = (%q,%v), want (k,1) on up-transition", lastPK, lastVal)
 	}
@@ -114,10 +114,11 @@ func TestActive_DownAfterNUnansweredProbes(t *testing.T) {
 	clk := ts(1000)
 	pass := newPassiveLiveness(3, func() time.Time { return clk })
 	pass.setKeepalive("k", 25*time.Second)
-	pass.observe([]peerStat{{PublicKey: "k", ReceiveBytes: 100}}) // start live
+	pass.observe([]peerStat{{PublicKey: "k", ReceiveBytes: 100, LastHandshakeTime: ts(995)}}) // baseline + fresh handshake
 	probes := 0
 	a := newActiveLiveness(pass, 3, 15*time.Second, func() time.Time { return clk }, proberFunc(func(string) { probes++ }))
 	a.setAddr("k", "172.31.255.11")
+	a.probePass([]peerStat{{PublicKey: "k", ReceiveBytes: 100, LastHandshakeTime: ts(995)}}) // confirm reachable ⇒ live
 	if !a.IsLive("k") {
 		t.Fatal("starts live")
 	}
@@ -166,12 +167,12 @@ func TestController_AppliesOnlyOnTransition(t *testing.T) {
 	c := &LivenessController{
 		passive: pass,
 		active:  newActiveLiveness(pass, 3, 15*time.Second, func() time.Time { return clk }, proberFunc(func(string) {})),
-		reader:  fakeReader{peers: []peerStat{{PublicKey: "k", ReceiveBytes: 100}}},
+		reader:  fakeReader{peers: []peerStat{{PublicKey: "k", ReceiveBytes: 100, LastHandshakeTime: ts(995)}}},
 		apply:   func() error { applied++; return nil },
 		mode:    map[string]Mode{"k": ModePassive},
 		lastUp:  map[string]bool{},
 	}
-	c.tickOnce() // first observation: k transitions absent->live
+	c.tickOnce() // first observation: fresh handshake ⇒ k transitions dead->live
 	if applied != 1 {
 		t.Fatalf("expected 1 apply on first up-transition, got %d", applied)
 	}
@@ -200,7 +201,9 @@ func TestPassive_LiveWhileReceiveBytesAdvance(t *testing.T) {
 	clk := ts(1000)
 	p := newPassiveLiveness(3, func() time.Time { return clk })
 	p.setKeepalive("k", 25*time.Second) // downWindow = 75s
-	p.observe([]peerStat{{PublicKey: "k", ReceiveBytes: 100}})
+	// First observe is a baseline only; a fresh handshake is the absolute signal
+	// that makes the peer live within its window from the start.
+	p.observe([]peerStat{{PublicKey: "k", ReceiveBytes: 100, LastHandshakeTime: ts(1000)}})
 	clk = ts(1050) // 50s later, still within 75s
 	if !p.IsLive("k") {
 		t.Fatal("peer within downWindow must be live")
@@ -223,7 +226,7 @@ func TestPassive_KeepaliveLessFallsBackTo180s(t *testing.T) {
 	clk := ts(1000)
 	p := newPassiveLiveness(3, func() time.Time { return clk })
 	// no setKeepalive ⇒ 180s fallback
-	p.observe([]peerStat{{PublicKey: "k", ReceiveBytes: 100}})
+	p.observe([]peerStat{{PublicKey: "k", ReceiveBytes: 100, LastHandshakeTime: ts(1000)}})
 	clk = ts(1170) // 170s < 180s
 	if !p.IsLive("k") {
 		t.Fatal("keepalive-less peer within 180s must be live")
@@ -318,3 +321,96 @@ func TestDesiredKernelRoutes_GatedByLiveness(t *testing.T) {
 type fakeSource struct{ live map[string]bool }
 
 func (f fakeSource) IsLive(pk string) bool { return f.live[pk] }
+
+// --- start-dead semantics: gated peers must NOT hold routes until confirmed ---
+
+// A gated (passive) peer with a stale wgctrl counter but no recent handshake
+// must start DEAD on the first observation, so desiredKernelRoutes excludes its
+// downstream CIDR (no blackhole during the initial window). The stale nonzero
+// ReceiveBytes is a pre-existing counter (agent restarted against a live wg0),
+// not fresh traffic.
+func TestPassive_StartsDeadWithStaleCounterNoHandshake(t *testing.T) {
+	clk := ts(1000)
+	p := newPassiveLiveness(3, func() time.Time { return clk })
+	p.setKeepalive("k", 25*time.Second)
+	// Counter already nonzero at first sight; handshake is old (outside window).
+	p.observe([]peerStat{{PublicKey: "k", ReceiveBytes: 100, LastHandshakeTime: ts(800)}})
+	if p.IsLive("k") {
+		t.Fatal("gated peer with stale counter / no fresh handshake must start dead")
+	}
+	// And its routes must NOT be installed.
+	peers := []v1alpha1.WireguardPeer{
+		{Spec: v1alpha1.WireguardPeerSpec{PublicKey: validPeerPublicKey, Address: "10.0.0.1", Routes: []string{"10.254.2.0/24"}}},
+	}
+	src := fakeSource{live: map[string]bool{validPeerPublicKey: p.IsLive("k")}}
+	if got := desiredKernelRoutes(peers, src); len(got) != 0 {
+		t.Fatalf("dead gated peer must install no routes, got %v", got)
+	}
+}
+
+// A gated (active) peer must also start DEAD on the first observation: with the
+// cluster default of active, a down site peer must not hold its /24 through the
+// ~N*probeInterval window. Only a confirmed probe / progress revives it.
+func TestActive_StartsDeadUntilConfirmed(t *testing.T) {
+	clk := ts(1000)
+	pass := newPassiveLiveness(3, func() time.Time { return clk })
+	pass.setKeepalive("k", 25*time.Second)
+	a := newActiveLiveness(pass, 3, 15*time.Second, func() time.Time { return clk }, proberFunc(func(string) {}))
+	a.setAddr("k", "172.31.255.11")
+	// Stale counter, no fresh handshake — exactly the production down-peer case.
+	pass.observe([]peerStat{{PublicKey: "k", ReceiveBytes: 100, LastHandshakeTime: ts(800)}})
+	if a.IsLive("k") {
+		t.Fatal("active peer must start dead before any probe/progress confirms it")
+	}
+	a.probePass([]peerStat{{PublicKey: "k", ReceiveBytes: 100, LastHandshakeTime: ts(800)}})
+	if a.IsLive("k") {
+		t.Fatal("an unanswered/quiet active peer must remain dead (no confirmation)")
+	}
+}
+
+// A gated (passive) peer with a FRESH handshake must be live on the very first
+// check — the handshake age is absolute, so live peers get their routes back
+// within ~one check interval of startup rather than blackholing.
+func TestPassive_FreshHandshakeLiveOnFirstCheck(t *testing.T) {
+	clk := ts(1000)
+	p := newPassiveLiveness(3, func() time.Time { return clk })
+	p.setKeepalive("k", 25*time.Second)
+	p.observe([]peerStat{{PublicKey: "k", ReceiveBytes: 100, LastHandshakeTime: ts(990)}})
+	if !p.IsLive("k") {
+		t.Fatal("gated peer with a fresh handshake must be live on the first check")
+	}
+}
+
+// A gated (active) peer with a fresh handshake confirms and is live on the first
+// probe pass (tick 1), without waiting for a probe round-trip.
+func TestActive_FreshHandshakeLiveOnFirstCheck(t *testing.T) {
+	clk := ts(1000)
+	pass := newPassiveLiveness(3, func() time.Time { return clk })
+	pass.setKeepalive("k", 25*time.Second)
+	a := newActiveLiveness(pass, 3, 15*time.Second, func() time.Time { return clk }, proberFunc(func(string) {}))
+	a.setAddr("k", "172.31.255.11")
+	pass.observe([]peerStat{{PublicKey: "k", ReceiveBytes: 100, LastHandshakeTime: ts(990)}})
+	a.probePass([]peerStat{{PublicKey: "k", ReceiveBytes: 100, LastHandshakeTime: ts(990)}})
+	if !a.IsLive("k") {
+		t.Fatal("active peer with a fresh handshake must be live on the first check")
+	}
+}
+
+// A disabled-mode peer is ALWAYS live from the start (no initial gap): it is a
+// fallback gateway whose routes must be installed immediately. The controller's
+// IsLive short-circuits to true for disabled mode regardless of any counter.
+func TestController_DisabledPeerAlwaysLiveFromStart(t *testing.T) {
+	clk := ts(1000)
+	pass := newPassiveLiveness(3, func() time.Time { return clk })
+	c := &LivenessController{
+		passive:        pass,
+		active:         newActiveLiveness(pass, 3, 15*time.Second, func() time.Time { return clk }, proberFunc(func(string) {})),
+		clusterDefault: ModeActive,
+		mode:           map[string]Mode{"gw": ModeDisabled},
+		lastUp:         map[string]bool{},
+	}
+	// No observation at all — a disabled peer must still be live immediately.
+	if !c.IsLive("gw") {
+		t.Fatal("disabled-mode peer must be always-live from the start (fallback gateway)")
+	}
+}
