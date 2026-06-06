@@ -25,6 +25,33 @@ func (f fakeReader) readPeers() ([]peerStat, error) { return f.peers, f.err }
 
 func ts(sec int64) time.Time { return time.Unix(sec, 0) }
 
+func TestController_AppliesOnlyOnTransition(t *testing.T) {
+	clk := ts(1000)
+	pass := newPassiveLiveness(3, func() time.Time { return clk })
+	pass.setKeepalive("k", 25*time.Second)
+	applied := 0
+	c := &LivenessController{
+		source: pass,
+		reader: fakeReader{peers: []peerStat{{PublicKey: "k", ReceiveBytes: 100}}},
+		apply:  func() error { applied++; return nil },
+		lastUp: map[string]bool{},
+	}
+	c.tickOnce() // first observation: k transitions absent->live
+	if applied != 1 {
+		t.Fatalf("expected 1 apply on first up-transition, got %d", applied)
+	}
+	c.tickOnce() // no change ⇒ no apply
+	if applied != 1 {
+		t.Fatalf("quiet tick must not apply, got %d", applied)
+	}
+	clk = ts(1100) // 100s later, > 75s window, no new bytes
+	c.reader = fakeReader{peers: []peerStat{{PublicKey: "k", ReceiveBytes: 100}}}
+	c.tickOnce() // live->not-live transition
+	if applied != 2 {
+		t.Fatalf("expected apply on down-transition, got %d", applied)
+	}
+}
+
 func TestPassive_NeverActiveIsNotLive(t *testing.T) {
 	clk := ts(1000)
 	p := newPassiveLiveness(3, func() time.Time { return clk })

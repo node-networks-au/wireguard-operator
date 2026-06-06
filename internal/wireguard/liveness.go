@@ -1,10 +1,12 @@
 package wireguard
 
 import (
+	"context"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/go-logr/logr"
 	"golang.zx2c4.com/wireguard/wgctrl"
 )
 
@@ -182,4 +184,68 @@ func (p *passiveLiveness) IsLive(publicKey string) bool {
 		return false
 	}
 	return p.now().Sub(pr.lastAdvance) <= p.downWindow(publicKey)
+}
+
+// observer is the subset of a liveness source the controller drives each tick.
+type observer interface {
+	LivenessSource
+	observe([]peerStat)
+}
+
+// LivenessController owns the watcher goroutine. It reads the device on a timer,
+// folds it into the source, and calls apply() only when a peer's live state
+// transitions. It also IS the LivenessSource handed to the Wireguard struct.
+type LivenessController struct {
+	source        observer
+	reader        deviceReader
+	apply         func() error // wired to wg.Sync(latestState)
+	checkInterval time.Duration
+	logger        logr.Logger
+
+	mu     sync.Mutex
+	lastUp map[string]bool // pubkey -> last observed live state
+}
+
+func (c *LivenessController) IsLive(publicKey string) bool { return c.source.IsLive(publicKey) }
+
+// tickOnce performs one read+observe+transition-detect. Returns whether it applied.
+func (c *LivenessController) tickOnce() bool {
+	stats, err := c.reader.readPeers()
+	if err != nil {
+		c.logger.Error(err, "liveness read failed")
+		return false
+	}
+	c.source.observe(stats)
+	changed := false
+	c.mu.Lock()
+	for _, s := range stats {
+		up := c.source.IsLive(s.PublicKey)
+		if prev, ok := c.lastUp[s.PublicKey]; !ok || prev != up {
+			c.lastUp[s.PublicKey] = up
+			changed = true
+			c.logger.V(1).Info("peer liveness transition", "peer", s.PublicKey, "live", up)
+		}
+	}
+	c.mu.Unlock()
+	if changed && c.apply != nil {
+		if err := c.apply(); err != nil {
+			c.logger.Error(err, "liveness apply (wg.Sync) failed")
+		}
+		return true
+	}
+	return false
+}
+
+// Run drives tickOnce every checkInterval until ctx is done.
+func (c *LivenessController) Run(ctx context.Context) {
+	t := time.NewTicker(c.checkInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			c.tickOnce()
+		}
+	}
 }
