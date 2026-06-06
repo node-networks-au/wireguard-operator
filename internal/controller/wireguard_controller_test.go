@@ -1117,7 +1117,7 @@ var _ = Describe("wireguard controller", func() {
 					}
 				}
 				return ""
-			}, Timeout, Interval).Should(Equal("Address = 10.8.0.2, fd00::2"))
+			}, Timeout, Interval).Should(Equal("Address = 10.8.0.2/24, fd00::2/64"))
 		})
 
 		It("allocates only IPv6 addresses when ipv6Only is true", func() {
@@ -1203,7 +1203,7 @@ var _ = Describe("wireguard controller", func() {
 					}
 				}
 				return ""
-			}, Timeout, Interval).Should(Equal("Address = fd00:1::2"))
+			}, Timeout, Interval).Should(Equal("Address = fd00:1::2/64"))
 		})
 
 		It("reconciles deployment tolerations when spec changes", func() {
