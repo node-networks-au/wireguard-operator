@@ -9,6 +9,8 @@ import (
 
 	"github.com/go-logr/logr"
 	"golang.zx2c4.com/wireguard/wgctrl"
+
+	"github.com/nccloud/wireguard-operator/internal/agent"
 )
 
 // LivenessSource decides whether a peer's downstream routes (spec.routes /
@@ -339,4 +341,75 @@ func (a *activeLiveness) IsLive(publicKey string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.failed[publicKey] < a.failures
+}
+
+// Config holds the env-derived liveness knobs.
+type Config struct {
+	Mode          Mode
+	FailureCount  int           // N
+	CheckInterval time.Duration // watcher tick (WG_ROUTE_CHECK_INTERVAL)
+	ProbeInterval time.Duration // active probe cadence (WG_ROUTE_PROBE_INTERVAL)
+}
+
+// BuildController returns a configured controller, or nil for disabled mode.
+// The caller wires c.SetApply and starts c.Run; for disabled mode it leaves
+// Wireguard.Liveness nil (all-live, current behavior).
+func BuildController(cfg Config, reader deviceReader, logger logr.Logger) *LivenessController {
+	if cfg.Mode == ModeDisabled {
+		return nil
+	}
+	passive := newPassiveLiveness(cfg.FailureCount, time.Now)
+	var src observer = passive
+	if cfg.Mode == ModeActive {
+		src = newActiveLiveness(passive, cfg.FailureCount, cfg.ProbeInterval, time.Now, udpProber{})
+	}
+	return &LivenessController{
+		source:        src,
+		reader:        reader,
+		checkInterval: cfg.CheckInterval,
+		logger:        logger,
+		lastUp:        map[string]bool{},
+	}
+}
+
+// peerInfo is the minimal per-peer config the controller needs.
+type peerInfo struct {
+	PublicKey string
+	Keepalive time.Duration
+	Address   string
+}
+
+// SetPeers feeds per-peer keepalive + (active) tunnel addresses from the latest
+// state so windows and probe targets track config. Safe on every state change.
+func (c *LivenessController) SetPeers(peers []peerInfo) {
+	switch s := c.source.(type) {
+	case *passiveLiveness:
+		for _, p := range peers {
+			s.setKeepalive(p.PublicKey, p.Keepalive)
+		}
+	case *activeLiveness:
+		for _, p := range peers {
+			s.passive.setKeepalive(p.PublicKey, p.Keepalive)
+			s.setAddr(p.PublicKey, p.Address)
+		}
+	}
+}
+
+// SetApply wires the controller's transition action (wg.Sync of latest state).
+func (c *LivenessController) SetApply(fn func() error) { c.apply = fn }
+
+// NewDeviceReader returns the production wgctrl-backed reader (exported for main).
+func NewDeviceReader(iface string) (deviceReader, error) { return newWgctrlReader(iface) }
+
+// PeerInfos extracts the controller's per-peer config from agent state.
+func PeerInfos(state agent.State) []peerInfo {
+	out := make([]peerInfo, 0, len(state.Peers))
+	for _, p := range state.Peers {
+		var k time.Duration
+		if p.Spec.PersistentKeepalive != nil && *p.Spec.PersistentKeepalive > 0 {
+			k = time.Duration(*p.Spec.PersistentKeepalive) * time.Second
+		}
+		out = append(out, peerInfo{PublicKey: p.Spec.PublicKey, Keepalive: k, Address: p.Spec.Address})
+	}
+	return out
 }

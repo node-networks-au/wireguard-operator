@@ -4,8 +4,26 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
+
 	"github.com/nccloud/wireguard-operator/api/v1alpha1"
 )
+
+func TestBuildController_DisabledReturnsNil(t *testing.T) {
+	c := BuildController(Config{Mode: ModeDisabled}, nil, logr.Discard())
+	if c != nil {
+		t.Fatal("disabled mode must yield a nil controller (no watcher, nil Liveness)")
+	}
+}
+
+func TestBuildController_PassiveAndActiveNonNil(t *testing.T) {
+	for _, m := range []Mode{ModePassive, ModeActive} {
+		c := BuildController(Config{Mode: m, FailureCount: 3, CheckInterval: time.Second, ProbeInterval: 15 * time.Second}, fakeReader{}, logr.Discard())
+		if c == nil {
+			t.Fatalf("mode %q must yield a controller", m)
+		}
+	}
+}
 
 func TestPeerStat_FakeReaderRoundTrips(t *testing.T) {
 	now := time.Unix(1000, 0)
