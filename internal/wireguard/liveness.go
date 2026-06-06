@@ -1,6 +1,11 @@
 package wireguard
 
-import "strings"
+import (
+	"strings"
+	"time"
+
+	"golang.zx2c4.com/wireguard/wgctrl"
+)
 
 // LivenessSource decides whether a peer's downstream routes (spec.routes /
 // spec.routesV6) should currently be installed. A nil source means "all peers
@@ -43,3 +48,48 @@ func ParseMode(s string) Mode {
 // dead after this with no new handshake. Used as the keepalive-less passive
 // down threshold.
 const rejectAfterTime = 180 // seconds
+
+// peerStat is the liveness-relevant snapshot of one wg peer.
+type peerStat struct {
+	PublicKey         string
+	LastHandshakeTime time.Time
+	ReceiveBytes      int64
+}
+
+// deviceReader yields a snapshot of all peers' counters. Abstracted so the
+// liveness logic is unit-testable without a real wg0 / root / netlink.
+type deviceReader interface {
+	readPeers() ([]peerStat, error)
+}
+
+// wgctrlReader reads the live device via a long-lived wgctrl client.
+type wgctrlReader struct {
+	client *wgctrl.Client
+	iface  string
+}
+
+func newWgctrlReader(iface string) (*wgctrlReader, error) {
+	c, err := wgctrl.New()
+	if err != nil {
+		return nil, err
+	}
+	return &wgctrlReader{client: c, iface: iface}, nil
+}
+
+func (w *wgctrlReader) readPeers() ([]peerStat, error) {
+	dev, err := w.client.Device(w.iface)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]peerStat, 0, len(dev.Peers))
+	for _, p := range dev.Peers {
+		out = append(out, peerStat{
+			PublicKey:         p.PublicKey.String(),
+			LastHandshakeTime: p.LastHandshakeTime,
+			ReceiveBytes:      p.ReceiveBytes,
+		})
+	}
+	return out, nil
+}
+
+func (w *wgctrlReader) Close() error { return w.client.Close() }

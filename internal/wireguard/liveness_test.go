@@ -2,9 +2,26 @@ package wireguard
 
 import (
 	"testing"
+	"time"
 
 	"github.com/nccloud/wireguard-operator/api/v1alpha1"
 )
+
+func TestPeerStat_FakeReaderRoundTrips(t *testing.T) {
+	now := time.Unix(1000, 0)
+	r := fakeReader{peers: []peerStat{{PublicKey: "k", LastHandshakeTime: now, ReceiveBytes: 42}}}
+	got, err := r.readPeers()
+	if err != nil || len(got) != 1 || got[0].ReceiveBytes != 42 || got[0].PublicKey != "k" {
+		t.Fatalf("readPeers = %+v, %v", got, err)
+	}
+}
+
+type fakeReader struct {
+	peers []peerStat
+	err   error
+}
+
+func (f fakeReader) readPeers() ([]peerStat, error) { return f.peers, f.err }
 
 func TestWireguard_LivenessFieldDefaultsNil(t *testing.T) {
 	wg := Wireguard{}
