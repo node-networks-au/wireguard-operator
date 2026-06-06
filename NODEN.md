@@ -58,15 +58,70 @@ git push origin noden/main --force-with-lease
 
 ## Submitting an upstream PR
 
-1. Branch off `upstream/main`: `git checkout -b feature/listen-port upstream/main`
-2. Cherry-pick the relevant single commit from `noden/main`: `git cherry-pick <sha>`
+1. Branch off `upstream/main`: `git checkout -b feature/<topic> upstream/main`
+2. Cherry-pick the relevant commit(s) from `noden/main`, oldest first: `git cherry-pick <sha> [<sha> ...]`
 3. Push to `origin` and open the PR at `nccloud/wireguard-operator`.
-4. When merged, rebase `noden/main` to drop the now-upstream commit.
+4. When merged, rebase `noden/main` to drop the now-upstream commit(s).
 
-## Open upstream PR status
+## Upstream PR tracker
 
-- [ ] PR #N: AgentListenPort field — not yet submitted (held until cluster validation)
-- [ ] PR #N: ExternalPort field — not yet submitted
-- [ ] Contribution PR to PetzJohannes#1: WireguardPeer.Routes/RoutesV6 tests — pending (path 2: PR against author's fork branch)
-- [ ] PR #N: PersistentKeepalive — not yet submitted (cherry-pick from julianguinard)
-- [ ] PR #N: wg-syncconf replacement — not yet submitted (held until ~2 weeks production observation)
+The fork is 20 commits ahead of `upstream/main`. They group into six upstream-able PRs plus a
+fork-only set that stays here. Dependency / submission order: `1 → {2, 3, 4, 5} → 6`
+(2 & 3 are independent of 1; 4 & 5 stack on 1; 6 stacks on 1 + 4 + 5).
+
+All six branches are prepared locally (cherry-picked off `upstream/main`, compiled + tested), each
+with a `PR_BODY.md` in its worktree. **Nothing has been pushed or opened upstream.**
+
+| PR | Branch | Composition (commits incl. stacked base) |
+|----|--------|------------------------------------------|
+| 1  | `feature/wg-syncconf`                     | 2 |
+| 2  | `feature/agent-listenport-deploystrategy` | 3 |
+| 3  | `feature/external-port`                   | 1 |
+| 4  | `feature/peer-persistent-keepalive`       | 2 (syncconf) + 1 |
+| 5  | `feature/peer-routes`                     | 2 (syncconf) + 2 |
+| 6  | `feature/liveness-gated-routes`           | 2 (syncconf) + 2 (routes) + 1 (keepalive) + 1 |
+
+### Upstreaming (6 PRs)
+
+- [ ] **PR 1 — `wg syncconf` config application** (foundational)
+  - Commits: `cbf8242`, `7e2589b`
+  - Replaces `wgctrl.Configure` with `wg syncconf` so peer `AllowedIPs` survive reconciles;
+    syncconf temp file written under `/var/run/wireguard` (writable in the agent rootfs). No API change.
+  - Production-observation window (~2 weeks) has elapsed (live since 2026-06-05). Ready to submit.
+- [ ] **PR 2 — AgentListenPort + DeploymentStrategy** spec fields
+  - Commits: `b612bf9`, `78cae1a`, `9c480b0`
+  - Two `Wireguard` spec fields that shape the agent Deployment; `9c480b0` wires both into
+    `wireguard-dep`, so they ship together.
+- [ ] **PR 3 — ExternalPort** spec field
+  - Commit: `7fb6577`
+  - Overrides the advertised endpoint port in generated peer/client configs. Self-contained.
+- [ ] **PR 4 — PersistentKeepalive on WireguardPeer**
+  - Commits: `b2cce97`, `a8f8c58` — squashed on the branch into one client-side-only commit
+  - Stacks on PR 1 (the keepalive line is emitted from `BuildWgQuickConfig`). `a8f8c58` drops the
+    server-side emit (server is responder-only). Origin: cherry-pick from julianguinard — credit in
+    the PR.
+- [ ] **PR 5 — WireguardPeer Routes / RoutesV6** (config + kernel routes)
+  - Commits: `428ef9e` (AllowedIPs), `7455f27` (kernel-route install via `vishvananda/netlink` v1.3.1)
+  - Depends on PR 1. Open our own focused PR; reference the overlapping `PetzJohannes#1` — a
+    sprawling, test-deleting branch with a different (server-level) design, but it establishes the
+    netlink precedent (at v1.1.0), so our additive per-peer version is the cleaner candidate.
+- [ ] **PR 6 — Liveness-gated route failover** (submit squashed)
+  - Commits: `baeffe9`, `ba5f12d`, `b805382` — collapse into one squashed PR
+  - New `liveness.go` subsystem, agent env wiring, metrics, and `routeLiveness` CRD fields
+    (disabled/passive/active; per-peer cascade over instance/cluster default). Stacks on PR 1 + PR 4
+    + PR 5 (gates the syncconf/kernel routes; sizes the passive window from `PersistentKeepalive`).
+    Branch excludes the internal `docs/superpowers/` planning docs and swaps the AgentListenPort-PR-
+    dependent env test for a self-contained one.
+
+### Fork-only — not upstreaming (for now)
+
+- External-peer `<name>-peer` Secret convention + key provenance (`347f8a7`, `3632a46`) —
+  ESO-friendly Secret ownership; opinionated, kept as our own thing.
+- PSK + client-config default route (`a9d15f0`) — sources the PSK from the `<name>-peer` convention
+  above, so it is coupled to it; would need a `presharedKeyRef`-style decoupling before it could
+  upstream independently.
+- Fork infrastructure: `ci-noden` workflow (`2e03639`, `090808e`) and this `NODEN.md` (`ded906a`).
+- `bc98760` pre-commit golangci-lint hook — optional upstream nicety if ever wanted.
+
+Superseded: internal PR #1 (`feat/preshared-key`, `presharedKeyRef`/`publicKeyRef`) — closed;
+re-implemented as the convention-based approach above.
