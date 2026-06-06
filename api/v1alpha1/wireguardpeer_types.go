@@ -59,6 +59,16 @@ type WireguardPeerSpec struct {
 	EgressNetworkPolicies EgressNetworkPolicies `json:"egressNetworkPolicies,omitempty"`
 	DownloadSpeed         Speed                 `json:"downloadSpeed,omitempty"`
 	UploadSpeed           Speed                 `json:"uploadSpeed,omitempty"`
+	// PersistentKeepalive is the interval (in seconds) at which the peer
+	// sends a keep-alive message to maintain a NAT mapping and the wg
+	// handshake. Recommended 25s for peers behind NAT or stateful
+	// firewalls. Written into the peer-side wg-quick blob AND the
+	// server-side [Peer] block so the server maintains conntrack state
+	// for replies traversing OVN's natOutgoing SNAT.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	PersistentKeepalive *int32 `json:"persistentKeepalive,omitempty"`
 }
 
 type EgressNetworkPolicies []EgressNetworkPolicy

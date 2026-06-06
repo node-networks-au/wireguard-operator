@@ -422,6 +422,16 @@ func BuildWgQuickConfig(state agent.State, listenPort int) (string, error) {
 		}
 
 		fmt.Fprintf(&b, "\n[Peer]\nPublicKey = %s\nAllowedIPs = %s\n", peer.Spec.PublicKey, allowed)
+
+		// Intentionally NO PersistentKeepalive on the server-side [Peer] block:
+		// the server sits behind a stable LoadBalancer IP (not behind NAT), so
+		// it has no mapping to keep alive. The whole design is responder-only —
+		// peers initiate everything, the server only replies. PersistentKeepalive
+		// belongs on the PEER side (in the wg-quick blob handed to customer
+		// devices), where it keeps the peer's outbound NAT/conntrack mapping
+		// fresh. Setting it on the server makes the server emit unsolicited
+		// keepalive packets every N seconds once a peer has dialed in, which
+		// is "active" behavior we explicitly don't want.
 	}
 
 	return b.String(), nil
