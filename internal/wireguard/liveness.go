@@ -2,6 +2,7 @@ package wireguard
 
 import (
 	"context"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -165,7 +166,9 @@ func (p *passiveLiveness) downWindow(publicKey string) time.Duration {
 	return rejectAfterTime * time.Second
 }
 
-// freshWithin reports whether the peer showed progress within d (used by active).
+// freshWithin reports whether the peer showed progress strictly within the last
+// d (used by active to decide "still responding, don't probe"). Strict `<` so a
+// peer that last progressed exactly d ago is treated as quiet ⇒ due for a probe.
 func (p *passiveLiveness) freshWithin(publicKey string, d time.Duration) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -173,7 +176,7 @@ func (p *passiveLiveness) freshWithin(publicKey string, d time.Duration) bool {
 	if !ok || pr.lastAdvance.IsZero() {
 		return false
 	}
-	return p.now().Sub(pr.lastAdvance) <= d
+	return p.now().Sub(pr.lastAdvance) < d
 }
 
 func (p *passiveLiveness) IsLive(publicKey string) bool {
@@ -248,4 +251,92 @@ func (c *LivenessController) Run(ctx context.Context) {
 			c.tickOnce()
 		}
 	}
+}
+
+// prober forces a handshake toward a peer by sending a packet to its tunnel
+// address (routed via the retained /32). Abstracted for tests.
+type prober interface {
+	probe(addr string)
+}
+
+// udpProber sends one byte to <addr>:9 (discard). The kernel routes it via wg0,
+// which triggers a WireGuard handshake without needing the downstream route.
+type udpProber struct{}
+
+func (udpProber) probe(addr string) {
+	c, err := net.DialTimeout("udp", net.JoinHostPort(addr, "9"), time.Second)
+	if err != nil {
+		return
+	}
+	defer c.Close()
+	_, _ = c.Write([]byte{0})
+}
+
+// activeLiveness layers /32 probing over passive: it probes a quiet peer every
+// probeEvery and marks it down after N consecutive unanswered probes. Any
+// inbound progress resets the failure count.
+type activeLiveness struct {
+	passive    *passiveLiveness
+	prober     prober
+	failures   int
+	probeEvery time.Duration
+	now        func() time.Time
+
+	mu        sync.Mutex
+	failed    map[string]int
+	lastProbe map[string]time.Time
+	addr      map[string]string
+}
+
+func newActiveLiveness(passive *passiveLiveness, failures int, probeEvery time.Duration, now func() time.Time, pr prober) *activeLiveness {
+	if failures < 1 {
+		failures = 1
+	}
+	if now == nil {
+		now = time.Now
+	}
+	return &activeLiveness{
+		passive: passive, prober: pr, failures: failures, probeEvery: probeEvery, now: now,
+		failed: map[string]int{}, lastProbe: map[string]time.Time{}, addr: map[string]string{},
+	}
+}
+
+func (a *activeLiveness) setAddr(publicKey, addr string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if addr != "" {
+		a.addr[publicKey] = addr
+	}
+}
+
+// observe satisfies observer; it folds into passive then runs a probe pass.
+func (a *activeLiveness) observe(stats []peerStat) { a.tick(stats) }
+
+func (a *activeLiveness) tick(stats []peerStat) {
+	a.passive.observe(stats)
+	now := a.now()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, s := range stats {
+		pk := s.PublicKey
+		// Fresh progress within a probe interval ⇒ healthy, reset failures.
+		if a.passive.freshWithin(pk, a.probeEvery) {
+			a.failed[pk] = 0
+			continue
+		}
+		// Quiet: probe if due, count this probe as failed until progress proves it.
+		if now.Sub(a.lastProbe[pk]) >= a.probeEvery {
+			if addr := a.addr[pk]; addr != "" {
+				a.prober.probe(addr)
+			}
+			a.lastProbe[pk] = now
+			a.failed[pk]++
+		}
+	}
+}
+
+func (a *activeLiveness) IsLive(publicKey string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.failed[publicKey] < a.failures
 }

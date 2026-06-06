@@ -25,6 +25,50 @@ func (f fakeReader) readPeers() ([]peerStat, error) { return f.peers, f.err }
 
 func ts(sec int64) time.Time { return time.Unix(sec, 0) }
 
+func TestActive_DownAfterNUnansweredProbes(t *testing.T) {
+	clk := ts(1000)
+	pass := newPassiveLiveness(3, func() time.Time { return clk })
+	pass.setKeepalive("k", 25*time.Second)
+	pass.observe([]peerStat{{PublicKey: "k", ReceiveBytes: 100}}) // start live
+	probes := 0
+	a := newActiveLiveness(pass, 3, 15*time.Second, func() time.Time { return clk }, proberFunc(func(string) { probes++ }))
+	a.setAddr("k", "172.31.255.11")
+	if !a.IsLive("k") {
+		t.Fatal("starts live")
+	}
+	// advance past window with no progress; each probe interval => one failed probe
+	for i := 1; i <= 3; i++ {
+		clk = ts(1000 + int64(i)*15)
+		a.tick([]peerStat{{PublicKey: "k", ReceiveBytes: 100}})
+	}
+	if probes < 3 {
+		t.Fatalf("expected >=3 probes, got %d", probes)
+	}
+	if a.IsLive("k") {
+		t.Fatal("peer must be down after N unanswered probes")
+	}
+}
+
+func TestActive_ProbeResponseRevives(t *testing.T) {
+	clk := ts(1000)
+	pass := newPassiveLiveness(3, func() time.Time { return clk })
+	pass.setKeepalive("k", 25*time.Second)
+	pass.observe([]peerStat{{PublicKey: "k", ReceiveBytes: 100}})
+	a := newActiveLiveness(pass, 3, 15*time.Second, func() time.Time { return clk }, proberFunc(func(string) {}))
+	a.setAddr("k", "172.31.255.11")
+	clk = ts(1016)
+	a.tick([]peerStat{{PublicKey: "k", ReceiveBytes: 100}}) // 1 failed probe
+	clk = ts(1031)
+	a.tick([]peerStat{{PublicKey: "k", ReceiveBytes: 200}}) // RX advanced ⇒ revive
+	if !a.IsLive("k") {
+		t.Fatal("inbound progress must reset failure count and keep peer live")
+	}
+}
+
+type proberFunc func(addr string)
+
+func (f proberFunc) probe(addr string) { f(addr) }
+
 func TestController_AppliesOnlyOnTransition(t *testing.T) {
 	clk := ts(1000)
 	pass := newPassiveLiveness(3, func() time.Time { return clk })
