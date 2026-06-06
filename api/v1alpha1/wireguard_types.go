@@ -84,9 +84,11 @@ type WireguardSpec struct {
 	// passive (withdraw a peer's routes when its inbound goes silent), or active
 	// (passive + /32 handshake probes). Overrides the cluster default
 	// (WG_ROUTE_LIVENESS env); an individual WireguardPeer.spec.routeLiveness
-	// overrides this. Unset ⇒ inherit the cluster default.
+	// overrides this. Valid values: "disabled", "passive", "active". Unset/empty
+	// (or any unrecognised value) ⇒ inherit the cluster default. NOT enum-validated
+	// at the apiserver so KRO can always render the field as "" (inherit) — the
+	// agent validates (unknown ⇒ inherit, fail-safe).
 	// +optional
-	// +kubebuilder:validation:Enum=disabled;passive;active
 	RouteLiveness string `json:"routeLiveness,omitempty"`
 	// DeploymentStrategy overrides the operator's default RollingUpdate
 	// strategy on the wireguard-dep Deployment. Set Type: Recreate when

@@ -97,8 +97,10 @@ type WireguardPeerSpec struct {
 	// (Wireguard.spec.routeLiveness) then the cluster default. An explicit
 	// `disabled` forces this peer's routes always-on even when its instance is
 	// passive/active — e.g. a fallback gateway whose broad route must never flap.
+	// Valid values: "disabled", "passive", "active". Unset/empty (or any
+	// unrecognised value) ⇒ inherit. NOT enum-validated so KRO can always render
+	// "" (inherit); the agent validates (unknown ⇒ inherit, fail-safe).
 	// +optional
-	// +kubebuilder:validation:Enum=disabled;passive;active
 	RouteLiveness string `json:"routeLiveness,omitempty"`
 }
 
