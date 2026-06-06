@@ -21,6 +21,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"reflect"
 	"slices"
 	"strconv"
@@ -214,6 +215,24 @@ func effectivePeerCIDR4(wg *v1alpha1.Wireguard) string {
 	return ipam.DefaultPeerCIDR4
 }
 
+// addrWithMask appends cidr's prefix length to a bare peer address — e.g.
+// ("172.31.255.11", "172.31.255.0/24") -> "172.31.255.11/24". A bare address
+// (no mask) makes wg-quick install only a /32 (or /128) host route; carrying the
+// tunnel-network mask makes it install a connected route for the whole peer
+// subnet, which a site gateway needs so the cluster's return traffic (other
+// peers / SNAT VIPs) routes back through the tunnel instead of leaking out its
+// LAN. Returns addr unchanged if it already has a mask or cidr is empty/invalid.
+func addrWithMask(addr, cidr string) string {
+	if addr == "" || cidr == "" || strings.Contains(addr, "/") {
+		return addr
+	}
+	if _, ipnet, err := net.ParseCIDR(cidr); err == nil {
+		ones, _ := ipnet.Mask.Size()
+		return addr + "/" + strconv.Itoa(ones)
+	}
+	return addr
+}
+
 // effectivePeerCIDR6 returns the configured IPv6 peer CIDR and a boolean indicating
 // whether IPv6 is enabled for this Wireguard instance.
 func effectivePeerCIDR6(wg *v1alpha1.Wireguard) (string, bool) {
@@ -337,10 +356,10 @@ func (r *WireguardReconciler) updateWireguardPeers(ctx context.Context, req ctrl
 			if v, ok := peerPrivSecret.Data[peer.Spec.PrivateKey.SecretKeyRef.Key]; ok {
 				addresses := []string{}
 				if peer.Spec.Address != "" {
-					addresses = append(addresses, peer.Spec.Address)
+					addresses = append(addresses, addrWithMask(peer.Spec.Address, cidr4))
 				}
 				if peer.Spec.AddressV6 != "" {
-					addresses = append(addresses, peer.Spec.AddressV6)
+					addresses = append(addresses, addrWithMask(peer.Spec.AddressV6, cidr6))
 				}
 				addressLine := strings.Join(addresses, ", ")
 
