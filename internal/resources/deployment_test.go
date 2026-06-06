@@ -76,6 +76,32 @@ func cmdHasFlagValue(cmd []string, flag, value string) bool {
 	return false
 }
 
+func TestDeploymentAgentSurfacesRouteLivenessEnv(t *testing.T) {
+	b := newTestDeploymentBuilder(t)
+	wg := newTestWireguard(v1alpha1.WireguardSpec{})
+
+	dep, err := b.ForWireguard(wg)
+	if err != nil {
+		t.Fatalf("ForWireguard returned error: %v", err)
+	}
+
+	agent := agentContainer(t, dep.Spec.Template.Spec.Containers)
+	want := map[string]bool{
+		"WG_ROUTE_LIVENESS": false, "WG_ROUTE_FAILURE_COUNT": false,
+		"WG_ROUTE_CHECK_INTERVAL": false, "WG_ROUTE_PROBE_INTERVAL": false,
+	}
+	for _, e := range agent.Env {
+		if _, ok := want[e.Name]; ok {
+			want[e.Name] = true
+		}
+	}
+	for name, found := range want {
+		if !found {
+			t.Errorf("agent container must surface env %q (deployment-template passthrough)", name)
+		}
+	}
+}
+
 func TestDeploymentAgentListenPortDefault(t *testing.T) {
 	b := newTestDeploymentBuilder(t)
 	wg := newTestWireguard(v1alpha1.WireguardSpec{})
