@@ -65,12 +65,12 @@ git push origin noden/main --force-with-lease
 
 ## Upstream PR tracker
 
-The fork is 20 commits ahead of `upstream/main`. They group into six upstream-able PRs plus a
-fork-only set that stays here. Dependency / submission order: `1 → {2, 3, 4, 5} → 6`
-(2 & 3 are independent of 1; 4 & 5 stack on 1; 6 stacks on 1 + 4 + 5).
+The fork is 22 commits ahead of `upstream/main`. They group into seven upstream-able PRs plus a
+fork-only set that stays here. Dependency / submission order: `1 → {2, 3, 4, 5} → 6`; PR 7 is
+independent (2, 3, 7 are independent of 1; 4 & 5 stack on 1; 6 stacks on 1 + 4 + 5).
 
-All six branches are prepared locally (cherry-picked off `upstream/main`, compiled + tested), each
-with a `PR_BODY.md` in its worktree. **Nothing has been pushed or opened upstream.**
+All seven branches are prepared on `origin` (cherry-picked off `upstream/main`, compiled + tested),
+each with a `PR_BODY.md` in its worktree. **Pushed to origin only — nothing opened upstream.**
 
 | PR | Branch | Composition (commits incl. stacked base) |
 |----|--------|------------------------------------------|
@@ -80,8 +80,9 @@ with a `PR_BODY.md` in its worktree. **Nothing has been pushed or opened upstrea
 | 4  | `feature/peer-persistent-keepalive`       | 2 (syncconf) + 1 |
 | 5  | `feature/peer-routes`                     | 2 (syncconf) + 2 |
 | 6  | `feature/liveness-gated-routes`           | 2 (syncconf) + 2 (routes) + 1 (keepalive) + 1 |
+| 7  | `feature/peer-config-address-mask`        | 1 |
 
-### Upstreaming (6 PRs)
+### Upstreaming (7 PRs)
 
 - [ ] **PR 1 — `wg syncconf` config application** (foundational)
   - Commits: `cbf8242`, `7e2589b`
@@ -110,8 +111,16 @@ with a `PR_BODY.md` in its worktree. **Nothing has been pushed or opened upstrea
   - New `liveness.go` subsystem, agent env wiring, metrics, and `routeLiveness` CRD fields
     (disabled/passive/active; per-peer cascade over instance/cluster default). Stacks on PR 1 + PR 4
     + PR 5 (gates the syncconf/kernel routes; sizes the passive window from `PersistentKeepalive`).
-    Branch excludes the internal `docs/superpowers/` planning docs and swaps the AgentListenPort-PR-
-    dependent env test for a self-contained one.
+    Now also folds in `a2b3993` (#7 — controller reconciles `WG_ROUTE_*` env onto existing agent
+    Deployments, without which the feature stays inert on update). Branch excludes the internal
+    `docs/superpowers/` planning docs and swaps the AgentListenPort-PR-dependent env test for a
+    self-contained one.
+- [ ] **PR 7 — peer client-config Address subnet mask** (`db717ba`, #8)
+  - Independent fix off `upstream/main`: the generated `<wg>-peer-configs` `Address` carried a bare
+    IP (treated as `/32`/`/128` ⇒ host route only), so a site-gateway peer had no connected route
+    for the tunnel subnet and return traffic leaked out its LAN. Appends the peer CIDR prefix
+    (`effectivePeerCIDR4`/`6`); already-masked / unknown-CIDR addresses unchanged; full-tunnel peers
+    unaffected.
 
 ### Fork-only — not upstreaming (for now)
 
