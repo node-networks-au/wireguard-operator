@@ -6,6 +6,13 @@ import (
 	"github.com/nccloud/wireguard-operator/api/v1alpha1"
 )
 
+func TestWireguard_LivenessFieldDefaultsNil(t *testing.T) {
+	wg := Wireguard{}
+	if wg.Liveness != nil {
+		t.Fatal("Liveness must default nil (disabled / all-live)")
+	}
+}
+
 func TestPeerAllowedIPs_NotLiveDropsRoutesKeepsBase(t *testing.T) {
 	peer := v1alpha1.WireguardPeer{Spec: v1alpha1.WireguardPeerSpec{
 		PublicKey: validPeerPublicKey, Address: "172.31.255.11",

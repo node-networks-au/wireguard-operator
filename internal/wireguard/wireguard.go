@@ -214,7 +214,7 @@ func SyncLink(_ agent.State, iface string, wgUserspaceImplementationFallback str
 // ops added via `WireguardPeer.spec.allowedIPs`. `wg syncconf` honours the
 // supplied AllowedIPs CSV verbatim and only diffs peers that actually changed.
 func (wg *Wireguard) syncWireguard(state agent.State, iface string, listenPort int) error {
-	cfg, err := BuildWgQuickConfig(state, listenPort, nil)
+	cfg, err := BuildWgQuickConfig(state, listenPort, wg.Liveness)
 	if err != nil {
 		return err
 	}
@@ -253,6 +253,9 @@ type Wireguard struct {
 	ListenPort                        int
 	WgUserspaceImplementationFallback string
 	WgUseUserspaceImpl                bool
+	// Liveness gates per-peer spec.routes. nil ⇒ all peers live (disabled mode,
+	// byte-identical to pre-feature behavior).
+	Liveness LivenessSource
 }
 
 func (wg *Wireguard) Sync(state agent.State) error {
@@ -329,7 +332,7 @@ func (wg *Wireguard) Sync(state agent.State) error {
 	// eth0 and the underlying subnet gateway ICMP-redirects them. We
 	// log-and-continue on errors so a single bad CIDR doesn't block the
 	// rest of the reconcile (wg syncconf already succeeded).
-	if err := syncPeerRoutes(wg.Iface, state, wg.Logger); err != nil {
+	if err := syncPeerRoutes(wg.Iface, state, wg.Liveness, wg.Logger); err != nil {
 		wg.Logger.Error(err, "failed to sync peer routes")
 	}
 
@@ -408,13 +411,13 @@ func desiredKernelRoutes(peers []v1alpha1.WireguardPeer, src LivenessSource) []s
 //
 // Errors on individual route operations are logged and the function
 // continues — a single peer's bad CIDR shouldn't block the whole reconcile.
-func syncPeerRoutes(iface string, state agent.State, logger logr.Logger) error {
+func syncPeerRoutes(iface string, state agent.State, src LivenessSource, logger logr.Logger) error {
 	link, err := netlink.LinkByName(iface)
 	if err != nil {
 		return fmt.Errorf("failed to get link %s: %w", iface, err)
 	}
 
-	desired := desiredKernelRoutes(state.Peers, nil)
+	desired := desiredKernelRoutes(state.Peers, src)
 	desiredSet := map[string]bool{}
 	for _, c := range desired {
 		desiredSet[c] = true
