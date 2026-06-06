@@ -141,6 +141,72 @@ func TestBuildWgQuickConfig_SkipsDisabledAndEmptyKeys(t *testing.T) {
 	}
 }
 
+// TestBuildWgQuickConfig_OmitsPersistentKeepaliveServerSide locks down the
+// inversion of original Phase F: even when WireguardPeer.spec.persistentKeepalive
+// IS set on the CR, the server-side wg0 [Peer] block must NOT emit a
+// `PersistentKeepalive = <N>` line. The server is strictly responder-only —
+// it sits behind a stable LoadBalancer IP (not behind NAT) and has no mapping
+// to keep alive. PersistentKeepalive belongs on the PEER side only (in the
+// wg-quick blob handed to customer devices), where it keeps the peer's outbound
+// NAT/conntrack mapping fresh. Setting it on the server would make the server
+// emit unsolicited keepalive packets once a peer has dialed in, which is
+// "active" behavior we explicitly don't want.
+func TestBuildWgQuickConfig_OmitsPersistentKeepaliveServerSide(t *testing.T) {
+	keepalive := int32(25)
+	state := agent.State{
+		ServerPrivateKey: validServerPrivateKey,
+		Server:           v1alpha1.Wireguard{},
+		Peers: []v1alpha1.WireguardPeer{
+			{
+				Spec: v1alpha1.WireguardPeerSpec{
+					PublicKey:           validPeerPublicKey,
+					Address:             "172.31.255.11",
+					PersistentKeepalive: &keepalive,
+				},
+			},
+		},
+	}
+
+	cfg, err := BuildWgQuickConfig(state, 51820)
+	if err != nil {
+		t.Fatalf("BuildWgQuickConfig: %v", err)
+	}
+
+	if strings.Contains(cfg, "PersistentKeepalive") {
+		t.Errorf("server-side wg0 [Peer] block must NOT include PersistentKeepalive even when the CR field is set (server is responder-only; only the peer-side wg-quick blob should set keepalive):\n%s", cfg)
+	}
+}
+
+// TestBuildWgQuickConfig_OmitsPersistentKeepaliveWhenUnset locks down backwards
+// compatibility: peers without the new field (the entire installed fleet at
+// rollout time) must produce a [Peer] block with no PersistentKeepalive line.
+// `wg syncconf` treats an absent PersistentKeepalive as "0" (disabled), and
+// emitting a stray line would either error on parse or — worse — silently
+// re-enable keepalives ops never asked for.
+func TestBuildWgQuickConfig_OmitsPersistentKeepaliveWhenUnset(t *testing.T) {
+	state := agent.State{
+		ServerPrivateKey: validServerPrivateKey,
+		Server:           v1alpha1.Wireguard{},
+		Peers: []v1alpha1.WireguardPeer{
+			{
+				Spec: v1alpha1.WireguardPeerSpec{
+					PublicKey: validPeerPublicKey,
+					Address:   "172.31.255.11",
+				},
+			},
+		},
+	}
+
+	cfg, err := BuildWgQuickConfig(state, 51820)
+	if err != nil {
+		t.Fatalf("BuildWgQuickConfig: %v", err)
+	}
+
+	if strings.Contains(cfg, "PersistentKeepalive") {
+		t.Errorf("PersistentKeepalive must NOT appear when the field is unset:\n%s", cfg)
+	}
+}
+
 // TestBuildWgQuickConfig_TrimsAllowedIPsWhitespace covers the common case where
 // ops paste a CSV with spaces — `172.31.255.11/32, 10.254.0.0/16`. wg syncconf
 // is strict about CSV format; we must normalize.
