@@ -216,12 +216,13 @@ type LivenessController struct {
 
 func (c *LivenessController) IsLive(publicKey string) bool { return c.source.IsLive(publicKey) }
 
-// tickOnce performs one read+observe+transition-detect. Returns whether it applied.
-func (c *LivenessController) tickOnce() bool {
+// tickOnce performs one read+observe+transition-detect, calling apply() iff a
+// peer's live state changed this tick.
+func (c *LivenessController) tickOnce() {
 	stats, err := c.reader.readPeers()
 	if err != nil {
 		c.logger.Error(err, "liveness read failed")
-		return false
+		return
 	}
 	c.source.observe(stats)
 	changed := false
@@ -246,9 +247,7 @@ func (c *LivenessController) tickOnce() bool {
 		if err := c.apply(); err != nil {
 			c.logger.Error(err, "liveness apply (wg.Sync) failed")
 		}
-		return true
 	}
-	return false
 }
 
 // Run drives tickOnce every checkInterval until ctx is done.
@@ -280,7 +279,7 @@ func (udpProber) probe(addr string) {
 	if err != nil {
 		return
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	_, _ = c.Write([]byte{0})
 }
 
