@@ -72,6 +72,15 @@ type WireguardPeerSpec struct {
 	// See Routes for full semantics.
 	// +optional
 	RoutesV6 []string `json:"routesV6,omitempty"`
+	// PersistentKeepalive is the interval (in seconds) at which the peer
+	// sends a keep-alive message to maintain a NAT mapping and the wg
+	// handshake. Recommended 25s for peers behind NAT or stateful
+	// firewalls. Emitted into the peer-side wg-quick blob (client config);
+	// the server is responder-only and does not emit it.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	PersistentKeepalive *int32 `json:"persistentKeepalive,omitempty"`
 }
 
 type EgressNetworkPolicies []EgressNetworkPolicy
