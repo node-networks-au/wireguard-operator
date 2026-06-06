@@ -116,6 +116,17 @@ spec:
                       type: object
                   type: object
                 type: array
+              persistentKeepalive:
+                description: |-
+                  PersistentKeepalive is the interval (in seconds) at which the peer
+                  sends a keep-alive message to maintain a NAT mapping and the wg
+                  handshake. Recommended 25s for peers behind NAT or stateful
+                  firewalls. Emitted into the peer-side wg-quick blob (client config);
+                  the server is responder-only and does not emit it.
+                format: int32
+                maximum: 65535
+                minimum: 1
+                type: integer
               privateKeyRef:
                 description: The private key of the peer
                 properties:
