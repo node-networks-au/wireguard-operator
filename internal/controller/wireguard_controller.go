@@ -80,6 +80,25 @@ func labelsForWireguard(name string) map[string]string {
 	return resources.LabelsForWireguard(name)
 }
 
+// routeLivenessEnvOf returns the WG_ROUTE_*-prefixed env vars set on the agent
+// container, as a name->value map (empty if the container or its env is absent).
+// Used to reconcile the liveness-gated-route env that the deployment builder
+// surfaces from the manager's own env onto every agent.
+func routeLivenessEnvOf(dep *appsv1.Deployment) map[string]string {
+	out := map[string]string{}
+	for _, c := range dep.Spec.Template.Spec.Containers {
+		if c.Name == "agent" {
+			for _, e := range c.Env {
+				if strings.HasPrefix(e.Name, "WG_ROUTE_") {
+					out[e.Name] = e.Value
+				}
+			}
+			break
+		}
+	}
+	return out
+}
+
 func (r *WireguardReconciler) ConfigmapForWireguard(m *v1alpha1.Wireguard, hostname string) *corev1.ConfigMap {
 	ls := labelsForWireguard(m.Name)
 	dep := &corev1.ConfigMap{
@@ -840,6 +859,21 @@ func (r *WireguardReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		err = r.Update(ctx, dep)
 		if err != nil {
 			log.Error(err, "unable to update deployment image", "dep.Namespace", dep.Namespace, "dep.Name", dep.Name)
+			return ctrl.Result{}, err
+		}
+	}
+
+	// Reconcile the liveness-gated-route env (WG_ROUTE_*). The deployment builder
+	// reads these from the manager's own env at build time, so an agent Deployment
+	// created before the manager's setting was applied (or before it changed) would
+	// otherwise never pick it up — every other update branch here fires only on
+	// image/userspace/tunnel/scheduling/port drift, never env. Compare the agent's
+	// WG_ROUTE_* env to the freshly-built desired and update when they differ.
+	if desiredDep := r.deploymentForWireguard(wireguard); !reflect.DeepEqual(
+		routeLivenessEnvOf(deploymentFound), routeLivenessEnvOf(desiredDep)) {
+		log.Info("Updating deployment route-liveness env", "dep.Namespace", desiredDep.Namespace, "dep.Name", desiredDep.Name)
+		if err := r.Update(ctx, desiredDep); err != nil {
+			log.Error(err, "unable to update deployment route-liveness env", "dep.Namespace", desiredDep.Namespace, "dep.Name", desiredDep.Name)
 			return ctrl.Result{}, err
 		}
 	}

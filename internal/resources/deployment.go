@@ -18,6 +18,7 @@ package resources
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/nccloud/wireguard-operator/api/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
@@ -26,6 +27,26 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
+
+// routeLivenessEnvKeys are the agent's liveness-gated-route knobs, surfaced on
+// the agent container from the operator's own env. A single setting on the
+// manager Deployment thus flows to every agent. Unset ⇒ empty value ⇒ the agent
+// defaults to disabled (byte-identical to current behavior). This keeps the
+// feature a deployment-template-only change (no CRD/spec field).
+var routeLivenessEnvKeys = []string{
+	"WG_ROUTE_LIVENESS",
+	"WG_ROUTE_FAILURE_COUNT",
+	"WG_ROUTE_CHECK_INTERVAL",
+	"WG_ROUTE_PROBE_INTERVAL",
+}
+
+func routeLivenessEnv() []corev1.EnvVar {
+	env := make([]corev1.EnvVar, 0, len(routeLivenessEnvKeys))
+	for _, k := range routeLivenessEnvKeys {
+		env = append(env, corev1.EnvVar{Name: k, Value: os.Getenv(k)})
+	}
+	return env
+}
 
 const (
 	// HTTPPort is the port for HTTP health checks.
@@ -174,6 +195,7 @@ func (b *DeploymentBuilder) agentContainer(wg *v1alpha1.Wireguard, readOnlyRootF
 				Protocol:      corev1.ProtocolTCP,
 			},
 		},
+		Env: routeLivenessEnv(),
 		EnvFrom: []corev1.EnvFromSource{
 			{
 				ConfigMapRef: &corev1.ConfigMapEnvSource{

@@ -214,7 +214,7 @@ func SyncLink(_ agent.State, iface string, wgUserspaceImplementationFallback str
 // ops added via `WireguardPeer.spec.allowedIPs`. `wg syncconf` honours the
 // supplied AllowedIPs CSV verbatim and only diffs peers that actually changed.
 func (wg *Wireguard) syncWireguard(state agent.State, iface string, listenPort int) error {
-	cfg, err := BuildWgQuickConfig(state, listenPort)
+	cfg, err := BuildWgQuickConfig(state, listenPort, wg.Liveness)
 	if err != nil {
 		return err
 	}
@@ -253,6 +253,9 @@ type Wireguard struct {
 	ListenPort                        int
 	WgUserspaceImplementationFallback string
 	WgUseUserspaceImpl                bool
+	// Liveness gates per-peer spec.routes. nil ⇒ all peers live (disabled mode,
+	// byte-identical to pre-feature behavior).
+	Liveness LivenessSource
 }
 
 func (wg *Wireguard) Sync(state agent.State) error {
@@ -329,7 +332,7 @@ func (wg *Wireguard) Sync(state agent.State) error {
 	// eth0 and the underlying subnet gateway ICMP-redirects them. We
 	// log-and-continue on errors so a single bad CIDR doesn't block the
 	// rest of the reconcile (wg syncconf already succeeded).
-	if err := syncPeerRoutes(wg.Iface, state, wg.Logger); err != nil {
+	if err := syncPeerRoutes(wg.Iface, state, wg.Liveness, wg.Logger); err != nil {
 		wg.Logger.Error(err, "failed to sync peer routes")
 	}
 
@@ -348,7 +351,7 @@ func (wg *Wireguard) Sync(state agent.State) error {
 // PublicKey-less peer can't actually carry packets, so its declared routes
 // must not appear in the kernel routing table either. This is a pure
 // function so it can be unit-tested without root or netlink.
-func desiredKernelRoutes(peers []v1alpha1.WireguardPeer) []string {
+func desiredKernelRoutes(peers []v1alpha1.WireguardPeer, src LivenessSource) []string {
 	seen := map[string]bool{}
 	var out []string
 	for _, peer := range peers {
@@ -356,6 +359,13 @@ func desiredKernelRoutes(peers []v1alpha1.WireguardPeer) []string {
 			continue
 		}
 		if peer.Spec.PublicKey == "" {
+			continue
+		}
+		// Liveness gate: mirror the Disabled skip — a not-live peer's downstream
+		// routes must not sit in the kernel table either (the RouteDel prune in
+		// syncPeerRoutes withdraws them when they drop out of this set). nil src
+		// ⇒ all-live (disabled mode, unchanged).
+		if !isLive(src, peer.Spec.PublicKey) {
 			continue
 		}
 		for _, r := range peer.Spec.Routes {
@@ -401,13 +411,13 @@ func desiredKernelRoutes(peers []v1alpha1.WireguardPeer) []string {
 //
 // Errors on individual route operations are logged and the function
 // continues — a single peer's bad CIDR shouldn't block the whole reconcile.
-func syncPeerRoutes(iface string, state agent.State, logger logr.Logger) error {
+func syncPeerRoutes(iface string, state agent.State, src LivenessSource, logger logr.Logger) error {
 	link, err := netlink.LinkByName(iface)
 	if err != nil {
 		return fmt.Errorf("failed to get link %s: %w", iface, err)
 	}
 
-	desired := desiredKernelRoutes(state.Peers)
+	desired := desiredKernelRoutes(state.Peers, src)
 	desiredSet := map[string]bool{}
 	for _, c := range desired {
 		desiredSet[c] = true
@@ -530,7 +540,7 @@ func gatewayIPFromPrefix(prefix netip.Prefix) (*net.IPNet, net.IP, error) {
 // responsible for, and the operator will splice them into the [Peer].AllowedIPs
 // the server enforces. Empty/unset Routes preserves the Phase E/F output
 // verbatim (no trailing comma, no extra CIDRs).
-func peerAllowedIPs(peer v1alpha1.WireguardPeer) string {
+func peerAllowedIPs(peer v1alpha1.WireguardPeer, src LivenessSource) string {
 	var out []string
 
 	if peer.Spec.AllowedIPs != "" {
@@ -548,14 +558,20 @@ func peerAllowedIPs(peer v1alpha1.WireguardPeer) string {
 		}
 	}
 
-	for _, r := range peer.Spec.Routes {
-		if r = strings.TrimSpace(r); r != "" {
-			out = append(out, r)
+	// Liveness gate: spec.routes / spec.routesV6 are the downstream CIDRs and are
+	// installed only while the peer is live. The base (above) is always kept so
+	// the peer can still handshake and recover. A not-live peer is treated like a
+	// Disabled peer FOR ROUTES ONLY. nil src ⇒ all-live (disabled mode, unchanged).
+	if isLive(src, peer.Spec.PublicKey) {
+		for _, r := range peer.Spec.Routes {
+			if r = strings.TrimSpace(r); r != "" {
+				out = append(out, r)
+			}
 		}
-	}
-	for _, r := range peer.Spec.RoutesV6 {
-		if r = strings.TrimSpace(r); r != "" {
-			out = append(out, r)
+		for _, r := range peer.Spec.RoutesV6 {
+			if r = strings.TrimSpace(r); r != "" {
+				out = append(out, r)
+			}
 		}
 	}
 
@@ -577,7 +593,7 @@ func peerAllowedIPs(peer v1alpha1.WireguardPeer) string {
 // [Peer] list as a diff: peers absent from the config are removed, peers
 // present are added/updated with their exact AllowedIPs CSV. This eliminates
 // the multi-CIDR truncation bug that Phase E fixes.
-func BuildWgQuickConfig(state agent.State, listenPort int) (string, error) {
+func BuildWgQuickConfig(state agent.State, listenPort int, src LivenessSource) (string, error) {
 	if state.ServerPrivateKey == "" {
 		return "", fmt.Errorf("server private key is empty")
 	}
@@ -596,7 +612,7 @@ func BuildWgQuickConfig(state agent.State, listenPort int) (string, error) {
 			continue
 		}
 
-		allowed := peerAllowedIPs(peer)
+		allowed := peerAllowedIPs(peer, src)
 		if allowed == "" {
 			continue
 		}

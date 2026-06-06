@@ -41,7 +41,7 @@ func TestBuildWgQuickConfig_PreservesMultiCIDRAllowedIPs(t *testing.T) {
 		},
 	}
 
-	cfg, err := BuildWgQuickConfig(state, 51820)
+	cfg, err := BuildWgQuickConfig(state, 51820, nil)
 	if err != nil {
 		t.Fatalf("BuildWgQuickConfig: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestBuildWgQuickConfig_NoSpecAllowedIPs(t *testing.T) {
 		},
 	}
 
-	cfg, err := BuildWgQuickConfig(state, 51820)
+	cfg, err := BuildWgQuickConfig(state, 51820, nil)
 	if err != nil {
 		t.Fatalf("BuildWgQuickConfig: %v", err)
 	}
@@ -94,7 +94,7 @@ func TestBuildWgQuickConfig_InterfaceSection(t *testing.T) {
 		Peers:            nil,
 	}
 
-	cfg, err := BuildWgQuickConfig(state, 51820)
+	cfg, err := BuildWgQuickConfig(state, 51820, nil)
 	if err != nil {
 		t.Fatalf("BuildWgQuickConfig: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestBuildWgQuickConfig_SkipsDisabledAndEmptyKeys(t *testing.T) {
 		},
 	}
 
-	cfg, err := BuildWgQuickConfig(state, 51820)
+	cfg, err := BuildWgQuickConfig(state, 51820, nil)
 	if err != nil {
 		t.Fatalf("BuildWgQuickConfig: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestBuildWgQuickConfig_RoutesAppendedToAllowedIPs(t *testing.T) {
 		},
 	}
 
-	cfg, err := BuildWgQuickConfig(state, 51820)
+	cfg, err := BuildWgQuickConfig(state, 51820, nil)
 	if err != nil {
 		t.Fatalf("BuildWgQuickConfig: %v", err)
 	}
@@ -192,7 +192,7 @@ func TestBuildWgQuickConfig_RoutesV6AppendedToAllowedIPs(t *testing.T) {
 		},
 	}
 
-	cfg, err := BuildWgQuickConfig(state, 51820)
+	cfg, err := BuildWgQuickConfig(state, 51820, nil)
 	if err != nil {
 		t.Fatalf("BuildWgQuickConfig: %v", err)
 	}
@@ -224,7 +224,7 @@ func TestBuildWgQuickConfig_RoutesAppendedToDefaultAllowedIPs(t *testing.T) {
 		},
 	}
 
-	cfg, err := BuildWgQuickConfig(state, 51820)
+	cfg, err := BuildWgQuickConfig(state, 51820, nil)
 	if err != nil {
 		t.Fatalf("BuildWgQuickConfig: %v", err)
 	}
@@ -256,7 +256,7 @@ func TestBuildWgQuickConfig_EmptyRoutesUnchanged(t *testing.T) {
 		},
 	}
 
-	cfg, err := BuildWgQuickConfig(state, 51820)
+	cfg, err := BuildWgQuickConfig(state, 51820, nil)
 	if err != nil {
 		t.Fatalf("BuildWgQuickConfig: %v", err)
 	}
@@ -284,7 +284,7 @@ func TestBuildWgQuickConfig_TrimsAllowedIPsWhitespace(t *testing.T) {
 		},
 	}
 
-	cfg, err := BuildWgQuickConfig(state, 51820)
+	cfg, err := BuildWgQuickConfig(state, 51820, nil)
 	if err != nil {
 		t.Fatalf("BuildWgQuickConfig: %v", err)
 	}
@@ -321,7 +321,7 @@ func TestDesiredKernelRoutes_CollectsRoutesAndRoutesV6(t *testing.T) {
 		},
 	}
 
-	got := desiredKernelRoutes(peers)
+	got := desiredKernelRoutes(peers, nil)
 	want := []string{"10.254.11.0/24", "192.168.42.0/24", "fd00:42::/48"}
 	if len(got) != len(want) {
 		t.Fatalf("desiredKernelRoutes len = %d (%v), want %d (%v)", len(got), got, len(want), want)
@@ -349,7 +349,7 @@ func TestDesiredKernelRoutes_SkipsDisabledAndEmptyKeyPeers(t *testing.T) {
 		{Spec: v1alpha1.WireguardPeerSpec{PublicKey: validPeerPublicKey2, Address: "10.0.0.3", Routes: []string{"10.30.0.0/24"}}},
 	}
 
-	got := desiredKernelRoutes(peers)
+	got := desiredKernelRoutes(peers, nil)
 	if len(got) != 1 || got[0] != "10.30.0.0/24" {
 		t.Errorf("desiredKernelRoutes filtered set = %v, want [10.30.0.0/24]", got)
 	}
@@ -370,7 +370,7 @@ func TestDesiredKernelRoutes_TrimsWhitespaceAndSkipsEmpty(t *testing.T) {
 		},
 	}
 
-	got := desiredKernelRoutes(peers)
+	got := desiredKernelRoutes(peers, nil)
 	wantSet := map[string]bool{"10.10.0.0/24": true, "fd00::/64": true}
 	if len(got) != 2 {
 		t.Fatalf("desiredKernelRoutes len = %d (%v), want 2", len(got), got)
@@ -393,7 +393,7 @@ func TestDesiredKernelRoutes_Dedupes(t *testing.T) {
 		{Spec: v1alpha1.WireguardPeerSpec{PublicKey: validPeerPublicKey2, Address: "10.0.0.2", Routes: []string{"10.10.0.0/24"}}},
 	}
 
-	got := desiredKernelRoutes(peers)
+	got := desiredKernelRoutes(peers, nil)
 	if len(got) != 1 || got[0] != "10.10.0.0/24" {
 		t.Errorf("desiredKernelRoutes dedup = %v, want [10.10.0.0/24]", got)
 	}

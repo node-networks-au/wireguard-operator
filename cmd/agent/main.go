@@ -8,13 +8,36 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"sync"
 	"syscall"
+	"time"
 
 	"github.com/go-logr/stdr"
 	"github.com/nccloud/wireguard-operator/internal/agent"
 	"github.com/nccloud/wireguard-operator/internal/iptables"
 	"github.com/nccloud/wireguard-operator/internal/wireguard"
 )
+
+// envInt reads a positive int env var, falling back to def.
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
+
+// envDur reads a positive Go-duration env var, falling back to def.
+func envDur(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return def
+}
 
 func main() {
 	var configFilePath string
@@ -84,8 +107,49 @@ func main() {
 		Logger: log.WithName("iptables"),
 	}
 
+	// Liveness-gated routes. cfg.Mode is the CLUSTER DEFAULT (WG_ROUTE_LIVENESS,
+	// default disabled); per-instance (Wireguard.spec.routeLiveness) and per-peer
+	// (WireguardPeer.spec.routeLiveness) override it. The watcher always runs so
+	// per-tenant/per-peer opt-in takes effect even when the cluster default is
+	// disabled; when every peer resolves to disabled it's a cheap no-op read loop
+	// (IsLive ⇒ true ⇒ routes static, byte-identical to current behavior).
+	livenessCfg := wireguard.Config{
+		Mode:          wireguard.ParseMode(os.Getenv("WG_ROUTE_LIVENESS")),
+		FailureCount:  envInt("WG_ROUTE_FAILURE_COUNT", 3),
+		CheckInterval: envDur("WG_ROUTE_CHECK_INTERVAL", time.Second),
+		ProbeInterval: envDur("WG_ROUTE_PROBE_INTERVAL", 15*time.Second),
+	}
+	var (
+		stateMu     sync.Mutex
+		latestState agent.State
+	)
+	applyLatest := func() error {
+		stateMu.Lock()
+		s := latestState
+		stateMu.Unlock()
+		return wg.Sync(s)
+	}
+	reader, rerr := wireguard.NewDeviceReader(iface)
+	var routeController *wireguard.LivenessController
+	if rerr != nil {
+		log.Error(rerr, "liveness: wgctrl reader unavailable; route gating disabled (routes static)")
+	} else {
+		routeController = wireguard.BuildController(livenessCfg, reader, log.WithName("liveness"))
+		wg.Liveness = routeController
+		routeController.SetApply(applyLatest)
+		log.Info("liveness controller started",
+			"clusterDefault", string(livenessCfg.Mode), "failureCount", livenessCfg.FailureCount,
+			"checkInterval", livenessCfg.CheckInterval.String(), "probeInterval", livenessCfg.ProbeInterval.String())
+	}
+
 	close, err := agent.OnStateChange(configFilePath, log.WithName("onStateChange"), func(state agent.State) {
 		log.Info("Received a new state")
+		stateMu.Lock()
+		latestState = state
+		stateMu.Unlock()
+		if routeController != nil {
+			routeController.SetPeers(wireguard.InstanceMode(state), wireguard.PeerInfos(state))
+		}
 		// Update metrics mapping for peer_name label
 		agent.UpdatePeerNameMapping(state.Peers)
 		err := wg.Sync(state)
@@ -147,6 +211,10 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
+
+	if routeController != nil {
+		go routeController.Run(ctx)
+	}
 
 	srv := &http.Server{Addr: ":8080"}
 	go func() {

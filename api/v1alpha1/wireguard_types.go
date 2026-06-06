@@ -57,6 +57,17 @@ type WireguardSpec struct {
 	ServiceType corev1.ServiceType `json:"serviceType,omitempty"`
 	// A field that specifies the value to use for a nodePort ServiceType
 	NodePort int32 `json:"port,omitempty"`
+	// RouteLiveness sets the default liveness-gating mode for THIS instance's
+	// peers: disabled (routes always installed — current static behavior),
+	// passive (withdraw a peer's routes when its inbound goes silent), or active
+	// (passive + /32 handshake probes). Overrides the cluster default
+	// (WG_ROUTE_LIVENESS env); an individual WireguardPeer.spec.routeLiveness
+	// overrides this. Valid values: "disabled", "passive", "active". Unset/empty
+	// (or any unrecognised value) ⇒ inherit the cluster default. NOT enum-validated
+	// at the apiserver so KRO can always render the field as "" (inherit) — the
+	// agent validates (unknown ⇒ inherit, fail-safe).
+	// +optional
+	RouteLiveness string `json:"routeLiveness,omitempty"`
 	// A map of key value strings for service annotations
 	ServiceAnnotations map[string]string `json:"serviceAnnotations,omitempty"`
 	// A boolean field that specifies whether IP forwarding should be enabled on the Wireguard VPN pod at startup. This can be useful to enable if the peers are having problems with sending traffic to the internet.
