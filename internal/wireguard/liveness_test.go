@@ -53,6 +53,22 @@ func TestParseMode(t *testing.T) {
 	}
 }
 
+func TestDesiredKernelRoutes_GatedByLiveness(t *testing.T) {
+	peers := []v1alpha1.WireguardPeer{
+		{Spec: v1alpha1.WireguardPeerSpec{PublicKey: validPeerPublicKey, Address: "10.0.0.1", Routes: []string{"10.254.1.0/24"}}},
+		{Spec: v1alpha1.WireguardPeerSpec{PublicKey: validPeerPublicKey2, Address: "10.0.0.2", Routes: []string{"10.254.2.0/24"}}},
+	}
+	src := fakeSource{live: map[string]bool{validPeerPublicKey: true, validPeerPublicKey2: false}}
+	got := desiredKernelRoutes(peers, src)
+	if len(got) != 1 || got[0] != "10.254.1.0/24" {
+		t.Errorf("gated desiredKernelRoutes = %v, want [10.254.1.0/24] (down peer's /24 excluded)", got)
+	}
+	all := desiredKernelRoutes(peers, nil) // disabled ⇒ both
+	if len(all) != 2 {
+		t.Errorf("nil source = %v, want both routes (unchanged)", all)
+	}
+}
+
 type fakeSource struct{ live map[string]bool }
 
 func (f fakeSource) IsLive(pk string) bool { return f.live[pk] }

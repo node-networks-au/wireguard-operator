@@ -348,7 +348,7 @@ func (wg *Wireguard) Sync(state agent.State) error {
 // PublicKey-less peer can't actually carry packets, so its declared routes
 // must not appear in the kernel routing table either. This is a pure
 // function so it can be unit-tested without root or netlink.
-func desiredKernelRoutes(peers []v1alpha1.WireguardPeer) []string {
+func desiredKernelRoutes(peers []v1alpha1.WireguardPeer, src LivenessSource) []string {
 	seen := map[string]bool{}
 	var out []string
 	for _, peer := range peers {
@@ -356,6 +356,13 @@ func desiredKernelRoutes(peers []v1alpha1.WireguardPeer) []string {
 			continue
 		}
 		if peer.Spec.PublicKey == "" {
+			continue
+		}
+		// Liveness gate: mirror the Disabled skip — a not-live peer's downstream
+		// routes must not sit in the kernel table either (the RouteDel prune in
+		// syncPeerRoutes withdraws them when they drop out of this set). nil src
+		// ⇒ all-live (disabled mode, unchanged).
+		if !isLive(src, peer.Spec.PublicKey) {
 			continue
 		}
 		for _, r := range peer.Spec.Routes {
@@ -407,7 +414,7 @@ func syncPeerRoutes(iface string, state agent.State, logger logr.Logger) error {
 		return fmt.Errorf("failed to get link %s: %w", iface, err)
 	}
 
-	desired := desiredKernelRoutes(state.Peers)
+	desired := desiredKernelRoutes(state.Peers, nil)
 	desiredSet := map[string]bool{}
 	for _, c := range desired {
 		desiredSet[c] = true
