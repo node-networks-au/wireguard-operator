@@ -302,6 +302,19 @@ spec:
                   ServiceType
                 format: int32
                 type: integer
+              routeLiveness:
+                description: |-
+                  RouteLiveness sets the default liveness-gating mode for THIS instance's
+                  peers: disabled (routes always installed — current static behavior),
+                  passive (withdraw a peer's routes when its inbound goes silent), or active
+                  (passive + /32 handshake probes). Overrides the cluster default
+                  (WG_ROUTE_LIVENESS env); an individual WireguardPeer.spec.routeLiveness
+                  overrides this. Unset ⇒ inherit the cluster default.
+                enum:
+                - disabled
+                - passive
+                - active
+                type: string
               serviceAnnotations:
                 additionalProperties:
                   type: string

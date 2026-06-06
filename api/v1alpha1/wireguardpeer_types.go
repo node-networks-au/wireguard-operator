@@ -91,6 +91,15 @@ type WireguardPeerSpec struct {
 	// See Routes for full semantics.
 	// +optional
 	RoutesV6 []string `json:"routesV6,omitempty"`
+	// RouteLiveness overrides the liveness-gating mode for THIS peer's routes:
+	// disabled (always installed), passive (withdraw on inbound silence), or
+	// active (passive + /32 handshake probes). Unset ⇒ inherit the instance
+	// (Wireguard.spec.routeLiveness) then the cluster default. An explicit
+	// `disabled` forces this peer's routes always-on even when its instance is
+	// passive/active — e.g. a fallback gateway whose broad route must never flap.
+	// +optional
+	// +kubebuilder:validation:Enum=disabled;passive;active
+	RouteLiveness string `json:"routeLiveness,omitempty"`
 }
 
 type EgressNetworkPolicies []EgressNetworkPolicy

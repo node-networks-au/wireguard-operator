@@ -79,6 +79,15 @@ type WireguardSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=65535
 	ExternalPort *int32 `json:"externalPort,omitempty"`
+	// RouteLiveness sets the default liveness-gating mode for THIS instance's
+	// peers: disabled (routes always installed — current static behavior),
+	// passive (withdraw a peer's routes when its inbound goes silent), or active
+	// (passive + /32 handshake probes). Overrides the cluster default
+	// (WG_ROUTE_LIVENESS env); an individual WireguardPeer.spec.routeLiveness
+	// overrides this. Unset ⇒ inherit the cluster default.
+	// +optional
+	// +kubebuilder:validation:Enum=disabled;passive;active
+	RouteLiveness string `json:"routeLiveness,omitempty"`
 	// DeploymentStrategy overrides the operator's default RollingUpdate
 	// strategy on the wireguard-dep Deployment. Set Type: Recreate when
 	// the WG pod's IP is pinned (e.g. via a CNI ip_address annotation)
