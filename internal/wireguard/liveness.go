@@ -209,6 +209,9 @@ type LivenessController struct {
 
 	mu     sync.Mutex
 	lastUp map[string]bool // pubkey -> last observed live state
+
+	// setGauge, if set, is called on every transition with 1 (live) / 0 (down).
+	setGauge func(publicKey string, value float64)
 }
 
 func (c *LivenessController) IsLive(publicKey string) bool { return c.source.IsLive(publicKey) }
@@ -229,6 +232,13 @@ func (c *LivenessController) tickOnce() bool {
 			c.lastUp[s.PublicKey] = up
 			changed = true
 			c.logger.V(1).Info("peer liveness transition", "peer", s.PublicKey, "live", up)
+			if c.setGauge != nil {
+				v := 0.0
+				if up {
+					v = 1.0
+				}
+				c.setGauge(s.PublicKey, v)
+			}
 		}
 	}
 	c.mu.Unlock()
@@ -363,12 +373,14 @@ func BuildController(cfg Config, reader deviceReader, logger logr.Logger) *Liven
 	if cfg.Mode == ModeActive {
 		src = newActiveLiveness(passive, cfg.FailureCount, cfg.ProbeInterval, time.Now, udpProber{})
 	}
+	gauge := routesActiveGauge()
 	return &LivenessController{
 		source:        src,
 		reader:        reader,
 		checkInterval: cfg.CheckInterval,
 		logger:        logger,
 		lastUp:        map[string]bool{},
+		setGauge:      func(pk string, v float64) { gauge.WithLabelValues(pk).Set(v) },
 	}
 }
 

@@ -43,6 +43,25 @@ func (f fakeReader) readPeers() ([]peerStat, error) { return f.peers, f.err }
 
 func ts(sec int64) time.Time { return time.Unix(sec, 0) }
 
+func TestController_SetsRoutesActiveGauge(t *testing.T) {
+	clk := ts(1000)
+	pass := newPassiveLiveness(3, func() time.Time { return clk })
+	pass.setKeepalive("k", 25*time.Second)
+	var lastPK string
+	var lastVal float64
+	c := &LivenessController{
+		source:   pass,
+		reader:   fakeReader{peers: []peerStat{{PublicKey: "k", ReceiveBytes: 100}}},
+		apply:    func() error { return nil },
+		lastUp:   map[string]bool{},
+		setGauge: func(pk string, v float64) { lastPK = pk; lastVal = v },
+	}
+	c.tickOnce()
+	if lastPK != "k" || lastVal != 1 {
+		t.Fatalf("gauge = (%q,%v), want (k,1) on up-transition", lastPK, lastVal)
+	}
+}
+
 func TestActive_DownAfterNUnansweredProbes(t *testing.T) {
 	clk := ts(1000)
 	pass := newPassiveLiveness(3, func() time.Time { return clk })
