@@ -60,6 +60,14 @@ const (
 	ConditionReady       = "Ready"
 	ConditionProgressing = "Progressing"
 	ConditionDegraded    = "Degraded"
+
+	// serverKeySourceAnnotation on a Wireguard CR marks its server keypair as provided
+	// externally (e.g. by external-secrets, sourced from 1Password). When set to
+	// serverKeySourceExternal the reconciler will NOT mint a key if the server Secret is
+	// missing — it waits for the external Secret and adopts it, so the server key survives
+	// a namespace rebuild instead of being regenerated (which breaks every peer).
+	serverKeySourceAnnotation = "vpn.wireguard-operator.io/server-key-source"
+	serverKeySourceExternal   = "external"
 )
 
 // WireguardReconciler reconciles a Wireguard object
@@ -811,7 +819,15 @@ func (r *WireguardReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 		if !bytes.Equal(b, secret.Data["state.json"]) {
 			log.Info("Updating secret with new config")
-			publicKey := string(secret.Data["publicKey"])
+			// Derive the public key when only the private key is present (e.g. external-
+			// secrets seeded just privateKey from 1Password) so the stored Secret and the
+			// peer client-configs carry the correct server public key, not an empty value.
+			publicKey := strings.TrimSpace(string(secret.Data["publicKey"]))
+			if publicKey == "" {
+				if k, perr := wgtypes.ParseKey(strings.TrimSpace(privateKey)); perr == nil {
+					publicKey = k.PublicKey().String()
+				}
+			}
 
 			err := r.Update(ctx, r.secretForWireguard(wireguard, b, privateKey, publicKey))
 			if err != nil {
@@ -848,6 +864,18 @@ func (r *WireguardReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 	// secret not yet created
 	if err != nil && errors.IsNotFound(err) {
+
+		// If the server key is provided externally (external-secrets / 1Password), do NOT
+		// mint one — minting races the external Secret and replaces the canonical key on
+		// every namespace rebuild, breaking all peers (they hold the old server pubkey).
+		// Wait for the Secret to appear; the branch above then adopts it.
+		if wireguard.Annotations[serverKeySourceAnnotation] == serverKeySourceExternal {
+			log.Info("server key is externally-sourced; waiting for the wireguard Secret instead of generating", "annotation", serverKeySourceAnnotation)
+			if serr := r.updateStatus(ctx, req, metav1.Condition{Type: ConditionProgressing, Status: metav1.ConditionTrue, Reason: "WaitingForExternalServerKey", Message: "waiting for external-secrets to create the server key Secret"}); serr != nil {
+				return ctrl.Result{}, serr
+			}
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
 
 		key, err := wgtypes.GeneratePrivateKey()
 
