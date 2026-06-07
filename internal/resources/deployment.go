@@ -40,7 +40,7 @@ var routeLivenessEnvKeys = []string{
 	"WG_ROUTE_PROBE_INTERVAL",
 }
 
-func routeLivenessEnv() []corev1.EnvVar {
+func RouteLivenessEnv() []corev1.EnvVar {
 	env := make([]corev1.EnvVar, 0, len(routeLivenessEnvKeys))
 	for _, k := range routeLivenessEnvKeys {
 		env = append(env, corev1.EnvVar{Name: k, Value: os.Getenv(k)})
@@ -209,7 +209,7 @@ func (b *DeploymentBuilder) agentContainer(wg *v1alpha1.Wireguard, readOnlyRootF
 				Protocol:      corev1.ProtocolTCP,
 			},
 		},
-		Env: routeLivenessEnv(),
+		Env: RouteLivenessEnv(),
 		EnvFrom: []corev1.EnvFromSource{
 			{
 				ConfigMapRef: &corev1.ConfigMapEnvSource{
