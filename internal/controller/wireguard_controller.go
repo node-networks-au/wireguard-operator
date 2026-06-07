@@ -1373,6 +1373,10 @@ func (r *WireguardReconciler) deploymentForWireguard(m *v1alpha1.Wireguard) *app
 									LocalObjectReference: corev1.LocalObjectReference{Name: m.Name + "-config"},
 								},
 							}},
+							// Surface the manager's WG_ROUTE_* liveness-gated-route env onto the agent.
+							// This is the builder the reconcile actually uses (the resources.Deployment-
+							// Builder also does it but is unused), and #7's env reconcile keeps it in sync.
+							Env: resources.RouteLivenessEnv(),
 							ReadinessProbe: &corev1.Probe{
 								ProbeHandler: corev1.ProbeHandler{
 									HTTPGet: &corev1.HTTPGetAction{
