@@ -849,14 +849,47 @@ func (r *WireguardReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	// secret not yet created
 	if err != nil && errors.IsNotFound(err) {
 
-		key, err := wgtypes.GeneratePrivateKey()
+		// Same-as-peers server-key adoption (mirrors the `<name>-peer` peer
+		// convention in the WireguardPeer reconciler): before minting a fresh
+		// random key, adopt an externally-provided server private key from the
+		// `<name>-server` convention Secret if present (ESO-owned, sourced from
+		// 1Password). This makes 1P the durable source of truth for the server
+		// key, so a namespace/Secret loss no longer regenerates a new key that
+		// would silently break every peer's handshake. The Secret is read-only
+		// here — the operator still writes state.json/publicKey to its own
+		// `<name>` Secret, so there is no co-ownership fight with ESO.
+		var privateKey, publicKey string
+		srcSecret := &corev1.Secret{}
+		srcErr := r.Get(ctx, types.NamespacedName{Name: wireguard.Name + "-server", Namespace: wireguard.Namespace}, srcSecret)
+		if srcErr == nil {
+			if ext := strings.TrimSpace(string(srcSecret.Data["privateKey"])); ext != "" {
+				k, perr := wgtypes.ParseKey(ext)
+				if perr != nil {
+					// FAIL CLOSED: a malformed external key must not fall through
+					// to minting a random one (that would change the server pubkey
+					// and break every peer). Surface and stop.
+					msg := fmt.Sprintf("server-key Secret %s-server holds an invalid WireGuard private key: %v", wireguard.Name, perr)
+					log.Error(perr, msg)
+					_ = r.updateStatus(ctx, req, metav1.Condition{Type: ConditionDegraded, Status: metav1.ConditionTrue, Reason: "ServerKeySourceInvalid", Message: msg})
+					return ctrl.Result{}, fmt.Errorf("%s", msg)
+				}
+				privateKey = k.String()
+				publicKey = k.PublicKey().String()
+				log.Info("Adopted server private key from external Secret", "secret", wireguard.Name+"-server")
+			}
+		} else if !errors.IsNotFound(srcErr) {
+			log.Error(srcErr, "Failed to read server-key Secret")
+			return ctrl.Result{}, srcErr
+		}
 
-		privateKey := key.String()
-		publicKey := key.PublicKey().String()
-
-		if err != nil {
-			log.Error(err, "Failed to generate private key")
-			return ctrl.Result{}, err
+		if privateKey == "" {
+			key, kerr := wgtypes.GeneratePrivateKey()
+			if kerr != nil {
+				log.Error(kerr, "Failed to generate private key")
+				return ctrl.Result{}, kerr
+			}
+			privateKey = key.String()
+			publicKey = key.PublicKey().String()
 		}
 		state := agent.State{
 			Server:           *wireguard.DeepCopy(),
