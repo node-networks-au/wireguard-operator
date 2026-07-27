@@ -7,6 +7,7 @@ import (
 	"github.com/go-logr/logr"
 
 	"github.com/nccloud/wireguard-operator/api/v1alpha1"
+	"github.com/nccloud/wireguard-operator/internal/agent"
 )
 
 func TestBuildController_AlwaysBuiltAndClusterDefaultUngated(t *testing.T) {
@@ -56,9 +57,11 @@ func TestController_PerPeerModeResolution(t *testing.T) {
 		lastUp:         map[string]bool{},
 	}
 	// instance=active; DC1 explicitly disabled (fallback); DC2 inherits active.
+	// Both are site peers carrying downstream routes — without routes there would
+	// be nothing to gate and both would resolve to disabled.
 	c.SetPeers("active", []peerInfo{
-		{PublicKey: "dc1", Mode: "disabled", Keepalive: 25 * time.Second, Address: "172.31.255.11"},
-		{PublicKey: "dc2", Mode: "", Keepalive: 25 * time.Second, Address: "172.31.255.12"},
+		{PublicKey: "dc1", Mode: "disabled", Keepalive: 25 * time.Second, Address: "172.31.255.11", HasRoutes: true},
+		{PublicKey: "dc2", Mode: "", Keepalive: 25 * time.Second, Address: "172.31.255.12", HasRoutes: true},
 	})
 	if c.modeFor("dc1") != ModeDisabled {
 		t.Errorf("dc1 explicit disabled, got %s", c.modeFor("dc1"))
@@ -68,6 +71,77 @@ func TestController_PerPeerModeResolution(t *testing.T) {
 	}
 	if !c.IsLive("dc1") {
 		t.Error("dc1 (disabled) must be ungated / always live")
+	}
+}
+
+func TestController_RouteLessPeerIsNeverGated(t *testing.T) {
+	// A peer with no routes has nothing to install or withdraw, so gating it can
+	// never change forwarding — it only produces pointless liveness transitions,
+	// each of which triggers an apply()/state push. Road-warrior peers (laptops
+	// that come and go) are exactly this shape, and their churn was driving
+	// fleet-wide state pushes. Such peers must be ungated regardless of mode.
+	clk := ts(1000)
+	pass := newPassiveLiveness(3, func() time.Time { return clk })
+	c := &LivenessController{
+		passive:        pass,
+		active:         newActiveLiveness(pass, 3, 15*time.Second, func() time.Time { return clk }, proberFunc(func(string) {})),
+		clusterDefault: ModeActive,
+		mode:           map[string]Mode{},
+		lastUp:         map[string]bool{},
+	}
+	c.SetPeers("active", []peerInfo{
+		{PublicKey: "roadwarrior", Mode: "", Keepalive: 25 * time.Second, Address: "172.31.255.8", HasRoutes: false},
+		{PublicKey: "site", Mode: "", Keepalive: 25 * time.Second, Address: "172.31.255.3", HasRoutes: true},
+	})
+	if got := c.modeFor("roadwarrior"); got != ModeDisabled {
+		t.Errorf("route-less peer must be ungated, got mode %q", got)
+	}
+	if !c.IsLive("roadwarrior") {
+		t.Error("route-less peer must always be live (nothing to gate)")
+	}
+	// A peer that does carry routes still inherits the active mode.
+	if got := c.modeFor("site"); got != ModeActive {
+		t.Errorf("peer with routes should inherit active, got %q", got)
+	}
+}
+
+func TestController_RouteLessPeerIgnoresExplicitActive(t *testing.T) {
+	// Even an explicit routeLiveness=active is meaningless without routes.
+	clk := ts(1000)
+	pass := newPassiveLiveness(3, func() time.Time { return clk })
+	c := &LivenessController{
+		passive:        pass,
+		active:         newActiveLiveness(pass, 3, 15*time.Second, func() time.Time { return clk }, proberFunc(func(string) {})),
+		clusterDefault: ModeDisabled,
+		mode:           map[string]Mode{},
+		lastUp:         map[string]bool{},
+	}
+	c.SetPeers("", []peerInfo{
+		{PublicKey: "rw", Mode: "active", Keepalive: 25 * time.Second, Address: "172.31.255.9", HasRoutes: false},
+	})
+	if got := c.modeFor("rw"); got != ModeDisabled {
+		t.Errorf("route-less peer must be ungated even when explicitly active, got %q", got)
+	}
+}
+
+func TestPeerInfos_DerivesHasRoutesFromSpec(t *testing.T) {
+	state := agent.State{Peers: []v1alpha1.WireguardPeer{
+		{Spec: v1alpha1.WireguardPeerSpec{PublicKey: "none", Address: "172.31.255.8"}},
+		{Spec: v1alpha1.WireguardPeerSpec{PublicKey: "v4", Address: "172.31.255.3", Routes: []string{"10.254.0.0/16"}}},
+		{Spec: v1alpha1.WireguardPeerSpec{PublicKey: "v6", Address: "172.31.255.4", RoutesV6: []string{"fd00::/64"}}},
+	}}
+	got := map[string]bool{}
+	for _, p := range PeerInfos(state) {
+		got[p.PublicKey] = p.HasRoutes
+	}
+	if got["none"] {
+		t.Error("peer without routes should have HasRoutes=false")
+	}
+	if !got["v4"] {
+		t.Error("peer with IPv4 routes should have HasRoutes=true")
+	}
+	if !got["v6"] {
+		t.Error("peer with only IPv6 routes should have HasRoutes=true")
 	}
 }
 
@@ -181,7 +255,7 @@ func TestController_AppliesOnlyOnTransition(t *testing.T) {
 		t.Fatalf("quiet tick must not apply, got %d", applied)
 	}
 	clk = ts(1100) // 100s later, > 75s window, no new bytes
-	c.tickOnce() // live->not-live transition
+	c.tickOnce()   // live->not-live transition
 	if applied != 2 {
 		t.Fatalf("expected apply on down-transition, got %d", applied)
 	}
