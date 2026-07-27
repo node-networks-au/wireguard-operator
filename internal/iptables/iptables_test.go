@@ -76,6 +76,29 @@ func TestIptableRules(t *testing.T) {
 # end of rules for peer 10.8.0.9`,
 		},
 		{
+			// Regression: an anycast DNS pair arrives as a comma+space separated
+			// list ("172.31.255.253, 172.31.255.254"). Interpolated raw it yields
+			// `-d 172.31.255.253, 172.31.255.254`, which iptables-restore tokenises
+			// on whitespace and rejects with "Bad argument `172.31.255.254'" —
+			// aborting the whole restore and leaving forwarding rules broken.
+			// Each address must get its own rule.
+			name:            "Multiple DNS servers emit one rule per address",
+			peerIp:          "10.8.0.9",
+			kubeDnsIp:       "172.31.255.253, 172.31.255.254",
+			wgServerIp:      "10.8.0.1",
+			networkPolicies: v1alpha1.EgressNetworkPolicies{},
+			expectedIptableRules: `# start of rules for peer 10.8.0.9
+:10-8-0-9 - [0:0]
+-A FORWARD -s 10.8.0.9 -j 10-8-0-9
+-A 10-8-0-9 -d 10.8.0.1 -p icmp -j ACCEPT
+-A 10-8-0-9 -d 10.8.0.9 -j ACCEPT
+-A 10-8-0-9 -d 172.31.255.253 -p UDP --dport 53 -j ACCEPT
+-A 10-8-0-9 -d 172.31.255.253 -p TCP --dport 53 -j ACCEPT
+-A 10-8-0-9 -d 172.31.255.254 -p UDP --dport 53 -j ACCEPT
+-A 10-8-0-9 -d 172.31.255.254 -p TCP --dport 53 -j ACCEPT
+# end of rules for peer 10.8.0.9`,
+		},
+		{
 			name:            "networkPolicies with 1 empty networkPolicy",
 			peerIp:          "10.8.0.11",
 			kubeDnsIp:       "100.64.0.21",

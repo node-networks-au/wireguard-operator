@@ -87,10 +87,23 @@ func GenerateIptableRulesFromNetworkPolicies(policies v1alpha1.EgressNetworkPoli
 
 		// allow peer to communicate with itself
 		fmt.Sprintf("-A %s -d %s -j ACCEPT", peerChain, peerIp),
+	}
 
-		// allow peer to communicate with kube-dns (UDP and TCP for large DNS responses)
-		fmt.Sprintf("-A %s -d %s -p UDP --dport 53 -j ACCEPT", peerChain, kubeDnsIp),
-		fmt.Sprintf("-A %s -d %s -p TCP --dport 53 -j ACCEPT", peerChain, kubeDnsIp),
+	// allow peer to communicate with kube-dns (UDP and TCP for large DNS responses).
+	// kubeDnsIp may carry more than one address (e.g. an anycast resolver pair) as a
+	// comma-separated list. iptables-restore takes a single address per -d and
+	// tokenises on whitespace, so interpolating the list raw produces
+	// `-d 1.2.3.4, 5.6.7.8` and the whole restore aborts with "Bad argument" —
+	// leaving the ruleset half-applied and forwarding broken. Emit one rule per address.
+	for _, dns := range strings.Split(kubeDnsIp, ",") {
+		dns = strings.TrimSpace(dns)
+		if dns == "" {
+			continue
+		}
+		rules = append(rules,
+			fmt.Sprintf("-A %s -d %s -p UDP --dport 53 -j ACCEPT", peerChain, dns),
+			fmt.Sprintf("-A %s -d %s -p TCP --dport 53 -j ACCEPT", peerChain, dns),
+		)
 	}
 
 	for _, policy := range policies {
