@@ -467,6 +467,7 @@ type peerInfo struct {
 	Keepalive time.Duration
 	Address   string
 	Mode      string // explicit per-peer routeLiveness ("" = inherit)
+	HasRoutes bool   // peer declares downstream routes (v4 or v6)
 }
 
 // SetPeers resolves each peer's effective mode (peer > instance > cluster default)
@@ -475,7 +476,15 @@ type peerInfo struct {
 func (c *LivenessController) SetPeers(instanceMode string, peers []peerInfo) {
 	c.mu.Lock()
 	for _, p := range peers {
-		c.mode[p.PublicKey] = resolveMode(p.Mode, instanceMode, c.clusterDefault)
+		m := resolveMode(p.Mode, instanceMode, c.clusterDefault)
+		// Gating only ever adds or withholds a peer's downstream routes, so a peer
+		// that declares none has nothing to gate. Left gated it would still flip
+		// live/down (road-warrior laptops do this constantly) and every flip calls
+		// apply() → a full state push, for no routing benefit. Force ungated.
+		if !p.HasRoutes {
+			m = ModeDisabled
+		}
+		c.mode[p.PublicKey] = m
 	}
 	c.mu.Unlock()
 	for _, p := range peers {
@@ -503,7 +512,13 @@ func PeerInfos(state agent.State) []peerInfo {
 		if p.Spec.PersistentKeepalive != nil && *p.Spec.PersistentKeepalive > 0 {
 			k = time.Duration(*p.Spec.PersistentKeepalive) * time.Second
 		}
-		out = append(out, peerInfo{PublicKey: p.Spec.PublicKey, Keepalive: k, Address: p.Spec.Address, Mode: p.Spec.RouteLiveness})
+		out = append(out, peerInfo{
+			PublicKey: p.Spec.PublicKey,
+			Keepalive: k,
+			Address:   p.Spec.Address,
+			Mode:      p.Spec.RouteLiveness,
+			HasRoutes: len(p.Spec.Routes) > 0 || len(p.Spec.RoutesV6) > 0,
+		})
 	}
 	return out
 }
