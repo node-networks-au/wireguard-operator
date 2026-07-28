@@ -1,9 +1,14 @@
 package iptables
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/go-logr/logr"
 	"github.com/nccloud/wireguard-operator/api/v1alpha1"
+	"github.com/nccloud/wireguard-operator/internal/agent"
 )
 
 // test helpers
@@ -160,4 +165,118 @@ func TestGenerateIptableRulesFromPeersUsesProvidedCIDR(t *testing.T) {
 
 func containsSubstring(s, sub string) bool {
 	return len(s) >= len(sub) && (s == sub || len(sub) == 0 || (len(s) > len(sub) && (containsSubstring(s[1:], sub) || s[:len(sub)] == sub)))
+}
+
+// fakeRestoreOnPath installs stub iptables-restore/ip6tables-restore binaries on PATH
+// that append one line per invocation to a counter file, and returns its path.
+// This exercises the real exec path rather than mocking it out.
+func fakeRestoreOnPath(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	counter := filepath.Join(dir, "invocations")
+	script := "#!/bin/sh\ncat >/dev/null\necho x >> " + counter + "\n"
+	for _, name := range []string{"iptables-restore", "ip6tables-restore"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0o755); err != nil {
+			t.Fatalf("writing stub %s: %v", name, err)
+		}
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return counter
+}
+
+func restoreInvocations(t *testing.T, counter string) int {
+	t.Helper()
+	b, err := os.ReadFile(counter)
+	if os.IsNotExist(err) {
+		return 0
+	}
+	if err != nil {
+		t.Fatalf("reading counter: %v", err)
+	}
+	return strings.Count(string(b), "x")
+}
+
+func testState() agent.State {
+	return agent.State{
+		Server: v1alpha1.Wireguard{
+			Spec:   v1alpha1.WireguardSpec{PeerCIDR: "10.8.0.0/24"},
+			Status: v1alpha1.WireguardStatus{Address: "192.168.1.1", Dns: "10.96.0.10"},
+		},
+		Peers: []v1alpha1.WireguardPeer{
+			{Spec: v1alpha1.WireguardPeerSpec{Address: "10.8.0.2"}},
+		},
+	}
+}
+
+// A gratuitous iptables-restore tears down and rebuilds the ruleset, which blackholes
+// forwarding through wg0 for ~1-3s. Every state push triggers one even when the rendered
+// ruleset is byte-identical, so the whole fleet false-downs. It must be skipped.
+func TestSyncSkipsRestoreWhenRulesUnchanged(t *testing.T) {
+	counter := fakeRestoreOnPath(t)
+	it := &Iptables{Logger: logr.Discard()}
+	state := testState()
+
+	if err := it.Sync(state); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	if got := restoreInvocations(t, counter); got != 1 {
+		t.Fatalf("first sync should apply once, got %d invocations", got)
+	}
+
+	if err := it.Sync(state); err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+	if got := restoreInvocations(t, counter); got != 1 {
+		t.Fatalf("second sync with identical rules must skip iptables-restore, got %d invocations", got)
+	}
+}
+
+func TestSyncReappliesWhenRulesChange(t *testing.T) {
+	counter := fakeRestoreOnPath(t)
+	it := &Iptables{Logger: logr.Discard()}
+	state := testState()
+
+	if err := it.Sync(state); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+
+	changed := testState()
+	changed.Peers = append(changed.Peers, v1alpha1.WireguardPeer{
+		Spec: v1alpha1.WireguardPeerSpec{Address: "10.8.0.3"},
+	})
+	if err := it.Sync(changed); err != nil {
+		t.Fatalf("sync after change: %v", err)
+	}
+
+	if got := restoreInvocations(t, counter); got != 2 {
+		t.Fatalf("changed rules must be re-applied, want 2 invocations, got %d", got)
+	}
+}
+
+// If the restore fails the cache must not be poisoned, otherwise a transient failure
+// would leave the dataplane permanently un-synced.
+func TestSyncRetriesAfterFailedApply(t *testing.T) {
+	dir := t.TempDir()
+	counter := filepath.Join(dir, "invocations")
+	// stub that records the call then fails
+	script := "#!/bin/sh\ncat >/dev/null\necho x >> " + counter + "\nexit 1\n"
+	for _, name := range []string{"iptables-restore", "ip6tables-restore"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0o755); err != nil {
+			t.Fatalf("writing stub %s: %v", name, err)
+		}
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	it := &Iptables{Logger: logr.Discard()}
+	state := testState()
+
+	if err := it.Sync(state); err == nil {
+		t.Fatalf("expected first sync to fail")
+	}
+	if err := it.Sync(state); err == nil {
+		t.Fatalf("expected second sync to fail")
+	}
+	if got := restoreInvocations(t, counter); got != 2 {
+		t.Fatalf("failed apply must not be cached, want 2 invocations, got %d", got)
+	}
 }
