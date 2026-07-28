@@ -31,6 +31,24 @@ func ApplyRulesV6(rules string) error {
 
 type Iptables struct {
 	Logger logr.Logger
+
+	// lastV4/lastV6 hold the most recently applied rulesets.
+	//
+	// iptables-restore is not free: it flushes and rebuilds the chains, which blackholes
+	// forwarding through wg0 for ~1-3s. Sync runs on every operator state push, and the
+	// rendered ruleset is usually byte-identical (a peer's routes or keys changing does
+	// not alter the rules at all), so re-applying it is pure downtime for no benefit.
+	// Re-applying only on an actual change removes that.
+	//
+	// The cache starts empty, so the first Sync after agent start always applies and the
+	// dataplane is guaranteed correct on restart. Nothing outside this agent writes these
+	// chains, so there is no periodic re-assert (one would reintroduce the very blip this
+	// avoids, far more often than state pushes occur).
+	//
+	// Not guarded by a mutex: Sync is only ever called from the single OnStateChange
+	// watcher goroutine. Guard these if that ever changes.
+	lastV4 string
+	lastV6 string
 }
 
 func (it *Iptables) Sync(state agent.State) error {
@@ -51,8 +69,13 @@ func (it *Iptables) Sync(state agent.State) error {
 		}
 		if cidr4 != "" {
 			cfg := GenerateIptableRulesFromPeers(cidr4, wgHostName, dns, peers)
-			if err := ApplyRules(cfg); err != nil {
-				return err
+			if cfg == it.lastV4 {
+				it.Logger.V(1).Info("iptables rules unchanged, skipping restore")
+			} else {
+				if err := ApplyRules(cfg); err != nil {
+					return err
+				}
+				it.lastV4 = cfg
 			}
 		}
 	}
@@ -61,8 +84,13 @@ func (it *Iptables) Sync(state agent.State) error {
 	if enableV6 {
 		cidr6 := spec.PeerCIDRv6
 		cfg6 := GenerateIp6tableRulesFromPeers(cidr6, wgHostName, dns, peers)
-		if err := ApplyRulesV6(cfg6); err != nil {
-			return err
+		if cfg6 == it.lastV6 {
+			it.Logger.V(1).Info("ip6tables rules unchanged, skipping restore")
+		} else {
+			if err := ApplyRulesV6(cfg6); err != nil {
+				return err
+			}
+			it.lastV6 = cfg6
 		}
 	}
 
