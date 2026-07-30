@@ -29,7 +29,6 @@ import (
 	"time"
 
 	"github.com/nccloud/wireguard-operator/api/v1alpha1"
-	"github.com/nccloud/wireguard-operator/internal/agent"
 	"github.com/nccloud/wireguard-operator/internal/ipam"
 	"github.com/nccloud/wireguard-operator/internal/resources"
 
@@ -797,11 +796,7 @@ func (r *WireguardReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			}
 		}
 
-		state := agent.State{
-			Server:           *wireguard.DeepCopy(),
-			ServerPrivateKey: privateKey,
-			Peers:            filteredPeers,
-		}
+		state := stateForAgent(wireguard, privateKey, filteredPeers)
 
 		b, err := json.Marshal(state)
 		if err != nil {
@@ -891,11 +886,7 @@ func (r *WireguardReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			privateKey = key.String()
 			publicKey = key.PublicKey().String()
 		}
-		state := agent.State{
-			Server:           *wireguard.DeepCopy(),
-			ServerPrivateKey: privateKey,
-			Peers:            filteredPeers,
-		}
+		state := stateForAgent(wireguard, privateKey, filteredPeers)
 
 		b, err := json.Marshal(state)
 		if err != nil {
