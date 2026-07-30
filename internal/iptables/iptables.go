@@ -3,6 +3,7 @@ package iptables
 import (
 	"fmt"
 	"os/exec"
+	"sort"
 	"strings"
 
 	"github.com/go-logr/logr"
@@ -55,7 +56,33 @@ func (it *Iptables) Sync(state agent.State) error {
 	it.Logger.Info("syncing network policies")
 	wgHostName := state.Server.Status.Address
 	dns := state.Server.Status.Dns
-	peers := state.Peers
+	// Render from a canonically ordered copy of the peers.
+	//
+	// The manager builds the peer list from a cached client List, which returns informer-map
+	// iteration order, so it reshuffles between reconciles even when no peer changed. The
+	// renderers below walk the slice in order, so without this the rendered ruleset comes out
+	// byte-different but semantically identical, the lastV4/lastV6 cache never hits, and every
+	// state push still runs a full restore -- the ~1-3s wg0 blackhole this cache exists to
+	// avoid. Sorting is semantically inert: each peer gets its own chain, peer addresses are
+	// disjoint, so the order rules are emitted in cannot change what matches.
+	//
+	// Copy rather than sort in place: the caller retains this slice (cmd/agent keeps it as
+	// latestState and re-applies wg.Sync on it) and must not observe our reordering.
+	//
+	// The key must be a total order across both families: IPv6-only tenants leave Address
+	// empty on every peer, so Address alone would tie and leave the order unstable there.
+	peers := make([]v1alpha1.WireguardPeer, len(state.Peers))
+	copy(peers, state.Peers)
+	sort.Slice(peers, func(i, j int) bool {
+		a, b := peers[i].Spec, peers[j].Spec
+		if a.Address != b.Address {
+			return a.Address < b.Address
+		}
+		if a.AddressV6 != b.AddressV6 {
+			return a.AddressV6 < b.AddressV6
+		}
+		return peers[i].Name < peers[j].Name
+	})
 	spec := state.Server.Spec
 
 	enableV6 := spec.PeerCIDRv6 != ""

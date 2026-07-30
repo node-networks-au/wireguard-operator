@@ -231,6 +231,99 @@ func TestSyncSkipsRestoreWhenRulesUnchanged(t *testing.T) {
 	}
 }
 
+// The manager builds the peer list from a cached client List, which returns informer-map
+// iteration order and so reshuffles between reconciles even when nothing about the peers
+// changed. Rendering walks the slice in order, so without a canonical order the rendered
+// ruleset is byte-different but semantically identical, the unchanged-ruleset cache never
+// hits, and every state push still runs a full restore -- blackholing wg0 for ~1-3s and
+// false-downing whole LibreNMS fleets. Measured in production: 54 syncs, 0 skips.
+func TestSyncSkipsRestoreWhenPeerOrderChanges(t *testing.T) {
+	counter := fakeRestoreOnPath(t)
+	it := &Iptables{Logger: logr.Discard()}
+
+	state := testState()
+	state.Peers = peersAt("10.8.0.2", "10.8.0.3", "10.8.0.4")
+	if err := it.Sync(state); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	if got := restoreInvocations(t, counter); got != 1 {
+		t.Fatalf("first sync should apply once, got %d invocations", got)
+	}
+
+	reordered := testState()
+	reordered.Peers = peersAt("10.8.0.4", "10.8.0.2", "10.8.0.3")
+	if err := it.Sync(reordered); err != nil {
+		t.Fatalf("sync with reordered peers: %v", err)
+	}
+	if got := restoreInvocations(t, counter); got != 1 {
+		t.Fatalf("reordering the same peer set must not re-apply, want 1 invocation, got %d", got)
+	}
+}
+
+// IPv6-only tenants leave Spec.Address empty on every peer, so ordering on Address alone is
+// not a total order and the render goes right back to being unstable -- for exactly the
+// deployments the cache is supposed to protect.
+func TestSyncSkipsRestoreWhenIPv6OnlyPeerOrderChanges(t *testing.T) {
+	counter := fakeRestoreOnPath(t)
+	it := &Iptables{Logger: logr.Discard()}
+
+	v6State := func(addrs ...string) agent.State {
+		s := testState()
+		s.Server.Spec = v1alpha1.WireguardSpec{PeerCIDRv6: "fd00::/64", IPv6Only: true}
+		s.Server.Status = v1alpha1.WireguardStatus{Address: "192.168.1.1", Dns: "fd00::10"}
+		s.Peers = nil
+		for _, a := range addrs {
+			s.Peers = append(s.Peers, v1alpha1.WireguardPeer{
+				Spec: v1alpha1.WireguardPeerSpec{AddressV6: a},
+			})
+		}
+		return s
+	}
+
+	if err := it.Sync(v6State("fd00::2", "fd00::3", "fd00::4")); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	if got := restoreInvocations(t, counter); got != 1 {
+		t.Fatalf("first sync should apply once, got %d invocations", got)
+	}
+
+	if err := it.Sync(v6State("fd00::4", "fd00::2", "fd00::3")); err != nil {
+		t.Fatalf("sync with reordered peers: %v", err)
+	}
+	if got := restoreInvocations(t, counter); got != 1 {
+		t.Fatalf("reordering the same IPv6-only peer set must not re-apply, want 1 invocation, got %d", got)
+	}
+}
+
+// Sync renders from the state, so it must not reorder the caller's slice: cmd/agent keeps
+// the pushed state in latestState and the liveness controller re-applies wg.Sync on it
+// later, and agent.UpdatePeerNameMapping reads the same slice. Canonicalising the order for
+// rendering must stay local to rendering.
+func TestSyncDoesNotReorderCallerPeers(t *testing.T) {
+	fakeRestoreOnPath(t)
+	it := &Iptables{Logger: logr.Discard()}
+
+	state := testState()
+	state.Peers = peersAt("10.8.0.4", "10.8.0.2", "10.8.0.3")
+	if err := it.Sync(state); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+
+	for i, want := range []string{"10.8.0.4", "10.8.0.2", "10.8.0.3"} {
+		if got := state.Peers[i].Spec.Address; got != want {
+			t.Fatalf("Sync reordered the caller's peers: index %d is %s, want %s", i, got, want)
+		}
+	}
+}
+
+func peersAt(addrs ...string) []v1alpha1.WireguardPeer {
+	peers := make([]v1alpha1.WireguardPeer, 0, len(addrs))
+	for _, a := range addrs {
+		peers = append(peers, v1alpha1.WireguardPeer{Spec: v1alpha1.WireguardPeerSpec{Address: a}})
+	}
+	return peers
+}
+
 func TestSyncReappliesWhenRulesChange(t *testing.T) {
 	counter := fakeRestoreOnPath(t)
 	it := &Iptables{Logger: logr.Discard()}
