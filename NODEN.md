@@ -121,6 +121,12 @@ each with a `PR_BODY.md` in its worktree. **Pushed to origin only — nothing op
     for the tunnel subnet and return traffic leaked out its LAN. Appends the peer CIDR prefix
     (`effectivePeerCIDR4`/`6`); already-masked / unknown-CIDR addresses unchanged; full-tunnel peers
     unaffected.
+- [ ] **PR 8 — preference for a route declared by more than one peer** (`routePriority`)
+  - Stacks on PR 5 + PR 6. A CIDR in `routes`/`routesV6` of several peers was written into every
+    `[Peer]`, so `wg syncconf` gave it to whichever section came last. The agent now installs a
+    contended CIDR only on the preferred peer that currently carries routes (lowest
+    `WireguardPeer.spec.routePriority`, then name), which with liveness gating gives
+    active/passive failover and failback for the same prefix. Agent-side; one additive CRD field.
 
 ### Fork-only — not upstreaming (for now)
 
