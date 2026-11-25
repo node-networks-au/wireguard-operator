@@ -74,4 +74,22 @@ jobs:
       - name: Run e2e tests
         run: |
           make kind
-          make run-e2e AGENT_IMAGE=wireguard-operator/agent:test MANAGER_IMAGE=wireguard-operator/manager:test
+          make run-e2e AGENT_IMAGE=wireguard-operator/agent:test MANAGER_IMAGE=wireguard-operator/manager:test SKIP_CLEANUP=1
+
+      - name: Dump cluster state on failure
+        if: failure()
+        run: |
+          set +e
+          kubectl config use-context kind-wg-kind-test
+          docker version --format '{{.Server.Version}}'
+          uname -r
+          kubectl get nodes -o wide
+          kubectl get pods -A -o wide
+          kubectl get deploy,wireguard,wireguardpeer -A
+          kubectl describe pods -n default
+          kubectl get events -A --sort-by=.lastTimestamp | tail -60
+          for p in $(kubectl get pods -n default -o name); do
+            echo "=== logs $p"; kubectl logs -n default "$p" --all-containers --tail=80
+            echo "=== previous $p"; kubectl logs -n default "$p" --all-containers --previous --tail=80
+          done
+          kubectl logs -n wireguard-system deploy/wireguard-controller-manager --all-containers --tail=120
