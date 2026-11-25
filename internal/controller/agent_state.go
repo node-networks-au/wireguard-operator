@@ -31,3 +31,5 @@ func stateForAgent(wireguard *v1alpha1.Wireguard, privateKey string, peers []v1a
 		Peers:            ordered,
 	}
 }
+
+// e2e baseline probe: no functional change.
