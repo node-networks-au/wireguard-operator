@@ -536,3 +536,155 @@ func TestWgSyncconfTempDir_IsWritableEmptyDirMount(t *testing.T) {
 		t.Errorf("wgSyncconfTempDir = %q, want %q (the operator's deployment template mounts an emptyDir at this path; changing it requires a matching volume change in internal/resources/deployment.go)", wgSyncconfTempDir, "/var/run/wireguard")
 	}
 }
+
+// allowedIPsByPeer parses a rendered wg-quick config into publicKey -> AllowedIPs CSV.
+func allowedIPsByPeer(t *testing.T, cfg string) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	key := ""
+	for _, line := range strings.Split(cfg, "\n") {
+		if v, ok := strings.CutPrefix(line, "PublicKey = "); ok {
+			key = v
+		}
+		if v, ok := strings.CutPrefix(line, "AllowedIPs = "); ok {
+			out[key] = v
+		}
+	}
+	return out
+}
+
+func dupRoutePeer(name, key, addr string, priority int32, routes ...string) v1alpha1.WireguardPeer {
+	p := v1alpha1.WireguardPeer{
+		Spec: v1alpha1.WireguardPeerSpec{
+			PublicKey:     key,
+			Address:       addr,
+			Routes:        routes,
+			RoutePriority: priority,
+		},
+	}
+	p.Name = name
+	return p
+}
+
+func buildAllowed(t *testing.T, src LivenessSource, peers ...v1alpha1.WireguardPeer) map[string]string {
+	t.Helper()
+	cfg, err := BuildWgQuickConfig(agent.State{ServerPrivateKey: validServerPrivateKey, Peers: peers}, 51820, src)
+	if err != nil {
+		t.Fatalf("BuildWgQuickConfig: %v", err)
+	}
+	return allowedIPsByPeer(t, cfg)
+}
+
+// A CIDR declared by two live peers must land on exactly one [Peer]: WireGuard
+// gives an allowed IP to a single peer, so rendering it twice lets the last
+// [Peer] in the file win by accident. The lowest routePriority owns it.
+func TestBuildWgQuickConfig_DuplicateRouteGoesToLowestPriority(t *testing.T) {
+	// Deliberately listed standby-first: preference must not depend on slice order.
+	got := buildAllowed(t, nil,
+		dupRoutePeer("site-dc2", validPeerPublicKey2, "172.31.255.12", 1, "10.254.0.0/16", "10.254.2.0/24"),
+		dupRoutePeer("site-dc1", validPeerPublicKey, "172.31.255.11", 0, "10.254.0.0/16"),
+	)
+	if want := "172.31.255.11/32,10.254.0.0/16"; got[validPeerPublicKey] != want {
+		t.Errorf("preferred peer AllowedIPs = %q, want %q", got[validPeerPublicKey], want)
+	}
+	// The standby keeps its /32 and its non-contended route.
+	if want := "172.31.255.12/32,10.254.2.0/24"; got[validPeerPublicKey2] != want {
+		t.Errorf("standby peer AllowedIPs = %q, want %q", got[validPeerPublicKey2], want)
+	}
+}
+
+// Priority beats name order: the higher-sorting name wins when it is preferred.
+func TestBuildWgQuickConfig_DuplicateRoutePriorityBeatsName(t *testing.T) {
+	got := buildAllowed(t, nil,
+		dupRoutePeer("site-dc1", validPeerPublicKey, "172.31.255.11", 5, "10.254.0.0/16"),
+		dupRoutePeer("site-dc2", validPeerPublicKey2, "172.31.255.12", 1, "10.254.0.0/16"),
+	)
+	if want := "172.31.255.12/32,10.254.0.0/16"; got[validPeerPublicKey2] != want {
+		t.Errorf("preferred peer AllowedIPs = %q, want %q", got[validPeerPublicKey2], want)
+	}
+	if want := "172.31.255.11/32"; got[validPeerPublicKey] != want {
+		t.Errorf("standby peer AllowedIPs = %q, want %q", got[validPeerPublicKey], want)
+	}
+}
+
+// Equal priority (the default, 0) falls back to name order, first name wins.
+func TestBuildWgQuickConfig_DuplicateRouteTieBreaksByName(t *testing.T) {
+	got := buildAllowed(t, nil,
+		dupRoutePeer("site-dc2", validPeerPublicKey2, "172.31.255.12", 0, "10.254.0.0/16"),
+		dupRoutePeer("site-dc1", validPeerPublicKey, "172.31.255.11", 0, "10.254.0.0/16"),
+	)
+	if want := "172.31.255.11/32,10.254.0.0/16"; got[validPeerPublicKey] != want {
+		t.Errorf("first-by-name AllowedIPs = %q, want %q", got[validPeerPublicKey], want)
+	}
+	if want := "172.31.255.12/32"; got[validPeerPublicKey2] != want {
+		t.Errorf("second-by-name AllowedIPs = %q, want %q", got[validPeerPublicKey2], want)
+	}
+}
+
+// When the preferred peer is not live the standby takes the route over, and
+// hands it back once the preferred peer returns.
+func TestBuildWgQuickConfig_DuplicateRouteFailsOverAndBack(t *testing.T) {
+	peers := []v1alpha1.WireguardPeer{
+		dupRoutePeer("site-dc1", validPeerPublicKey, "172.31.255.11", 0, "10.254.0.0/16"),
+		dupRoutePeer("site-dc2", validPeerPublicKey2, "172.31.255.12", 1, "10.254.0.0/16"),
+	}
+	down := buildAllowed(t, fakeSource{live: map[string]bool{validPeerPublicKey: false, validPeerPublicKey2: true}}, peers...)
+	if want := "172.31.255.11/32"; down[validPeerPublicKey] != want {
+		t.Errorf("dead preferred peer AllowedIPs = %q, want %q", down[validPeerPublicKey], want)
+	}
+	if want := "172.31.255.12/32,10.254.0.0/16"; down[validPeerPublicKey2] != want {
+		t.Errorf("standby AllowedIPs = %q, want %q", down[validPeerPublicKey2], want)
+	}
+	back := buildAllowed(t, fakeSource{live: map[string]bool{validPeerPublicKey: true, validPeerPublicKey2: true}}, peers...)
+	if want := "172.31.255.11/32,10.254.0.0/16"; back[validPeerPublicKey] != want {
+		t.Errorf("recovered preferred peer AllowedIPs = %q, want %q", back[validPeerPublicKey], want)
+	}
+	if want := "172.31.255.12/32"; back[validPeerPublicKey2] != want {
+		t.Errorf("standby after failback AllowedIPs = %q, want %q", back[validPeerPublicKey2], want)
+	}
+}
+
+// A Disabled or key-less peer cannot carry traffic, so it must not hold a
+// contended route away from a peer that can.
+func TestBuildWgQuickConfig_DuplicateRouteIgnoresUnusablePeers(t *testing.T) {
+	disabled := dupRoutePeer("a-disabled", validPeerPublicKey, "172.31.255.11", 0, "10.254.0.0/16")
+	disabled.Spec.Disabled = true
+	keyless := dupRoutePeer("b-keyless", "", "172.31.255.13", 0, "10.254.0.0/16")
+	got := buildAllowed(t, nil, disabled, keyless,
+		dupRoutePeer("site-dc2", validPeerPublicKey2, "172.31.255.12", 9, "10.254.0.0/16"),
+	)
+	if want := "172.31.255.12/32,10.254.0.0/16"; got[validPeerPublicKey2] != want {
+		t.Errorf("usable peer AllowedIPs = %q, want %q", got[validPeerPublicKey2], want)
+	}
+}
+
+// The same prefix written two ways is still one prefix to WireGuard, and IPv6
+// routes follow the same rule.
+func TestBuildWgQuickConfig_DuplicateRouteMatchesCanonicalPrefixAndV6(t *testing.T) {
+	a := dupRoutePeer("site-dc1", validPeerPublicKey, "172.31.255.11", 0, " 10.254.0.0/16 ")
+	a.Spec.RoutesV6 = []string{"fd00:254::/48"}
+	b := dupRoutePeer("site-dc2", validPeerPublicKey2, "172.31.255.12", 1, "10.254.9.9/16")
+	b.Spec.RoutesV6 = []string{"FD00:254:0::/48"}
+	got := buildAllowed(t, nil, a, b)
+	if want := "172.31.255.11/32,10.254.0.0/16,fd00:254::/48"; got[validPeerPublicKey] != want {
+		t.Errorf("preferred AllowedIPs = %q, want %q", got[validPeerPublicKey], want)
+	}
+	if want := "172.31.255.12/32"; got[validPeerPublicKey2] != want {
+		t.Errorf("standby AllowedIPs = %q, want %q", got[validPeerPublicKey2], want)
+	}
+}
+
+// Overlapping but different prefixes are not duplicates: longest-prefix match
+// already resolves them, so both stay.
+func TestBuildWgQuickConfig_OverlappingPrefixesAreNotDuplicates(t *testing.T) {
+	got := buildAllowed(t, nil,
+		dupRoutePeer("site-dc1", validPeerPublicKey, "172.31.255.11", 0, "10.254.0.0/16"),
+		dupRoutePeer("site-dc2", validPeerPublicKey2, "172.31.255.12", 1, "10.254.2.0/24"),
+	)
+	if want := "172.31.255.11/32,10.254.0.0/16"; got[validPeerPublicKey] != want {
+		t.Errorf("dc1 AllowedIPs = %q, want %q", got[validPeerPublicKey], want)
+	}
+	if want := "172.31.255.12/32,10.254.2.0/24"; got[validPeerPublicKey2] != want {
+		t.Errorf("dc2 AllowedIPs = %q, want %q", got[validPeerPublicKey2], want)
+	}
+}

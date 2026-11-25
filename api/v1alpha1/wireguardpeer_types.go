@@ -102,6 +102,20 @@ type WireguardPeerSpec struct {
 	// "" (inherit); the agent validates (unknown ⇒ inherit, fail-safe).
 	// +optional
 	RouteLiveness string `json:"routeLiveness,omitempty"`
+	// RoutePriority decides which peer carries a CIDR that more than one peer of
+	// the same Wireguard instance declares in routes / routesV6. WireGuard gives
+	// an allowed IP to exactly one peer, so the agent installs a contended CIDR
+	// only on the preferred peer that can currently carry it: enabled, keyed,
+	// and live under its route-liveness mode. The LOWEST value wins; equal values
+	// (including the default 0) fall back to peer name order, first name wins.
+	// When the preferred peer goes not-live the next one takes the CIDR over, and
+	// hands it back when the preferred peer recovers. Failover therefore needs the
+	// preferred peer to be liveness-gated: with routeLiveness "disabled" it always
+	// counts as live and never releases the CIDR. CIDRs only one peer declares
+	// are unaffected, as are overlapping but different prefixes (longest-prefix
+	// match already resolves those) and entries in the freeform allowedIPs CSV.
+	// +optional
+	RoutePriority int32 `json:"routePriority,omitempty"`
 }
 
 type EgressNetworkPolicies []EgressNetworkPolicy

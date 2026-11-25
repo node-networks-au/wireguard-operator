@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -541,6 +542,13 @@ func gatewayIPFromPrefix(prefix netip.Prefix) (*net.IPNet, net.IP, error) {
 // the server enforces. Empty/unset Routes preserves the Phase E/F output
 // verbatim (no trailing comma, no extra CIDRs).
 func peerAllowedIPs(peer v1alpha1.WireguardPeer, src LivenessSource) string {
+	return peerAllowedIPsExcept(peer, src, nil)
+}
+
+// peerAllowedIPsExcept is peerAllowedIPs minus the routes in `lost` (keyed by
+// routeKey): CIDRs this peer declares but that a more-preferred peer currently
+// carries. See contendedRoutesLost.
+func peerAllowedIPsExcept(peer v1alpha1.WireguardPeer, src LivenessSource, lost map[string]bool) string {
 	var out []string
 
 	if peer.Spec.AllowedIPs != "" {
@@ -564,18 +572,102 @@ func peerAllowedIPs(peer v1alpha1.WireguardPeer, src LivenessSource) string {
 	// Disabled peer FOR ROUTES ONLY. nil src ⇒ all-live (disabled mode, unchanged).
 	if isLive(src, peer.Spec.PublicKey) {
 		for _, r := range peer.Spec.Routes {
-			if r = strings.TrimSpace(r); r != "" {
+			if r = strings.TrimSpace(r); r != "" && !lost[routeKey(r)] {
 				out = append(out, r)
 			}
 		}
 		for _, r := range peer.Spec.RoutesV6 {
-			if r = strings.TrimSpace(r); r != "" {
+			if r = strings.TrimSpace(r); r != "" && !lost[routeKey(r)] {
 				out = append(out, r)
 			}
 		}
 	}
 
 	return strings.Join(out, ",")
+}
+
+// routeKey canonicalises a route CIDR so the same prefix written two ways
+// (host bits set, IPv6 case or zero-compression) compares equal. An entry that
+// does not parse is keyed by its trimmed text and left for `wg syncconf` to
+// reject, as before.
+func routeKey(cidr string) string {
+	cidr = strings.TrimSpace(cidr)
+	if p, err := netip.ParsePrefix(cidr); err == nil {
+		return p.Masked().String()
+	}
+	return cidr
+}
+
+// carriesRoutes reports whether a peer's spec.routes / spec.routesV6 are
+// rendered at all right now. It must stay in step with the skips in
+// BuildWgQuickConfig and the liveness gate in peerAllowedIPsExcept: a peer that
+// renders no routes must never hold a contended CIDR away from one that does.
+func carriesRoutes(peer v1alpha1.WireguardPeer, src LivenessSource) bool {
+	if peer.Spec.Disabled || peer.Spec.PublicKey == "" {
+		return false
+	}
+	if peer.Spec.Address == "" && peer.Spec.AddressV6 == "" {
+		return false
+	}
+	return isLive(src, peer.Spec.PublicKey)
+}
+
+// contendedRoutesLost resolves CIDRs that more than one peer declares in
+// spec.routes / spec.routesV6. WireGuard's cryptokey routing gives an allowed
+// IP to exactly one peer, so writing the same CIDR into two [Peer] sections
+// hands it to whichever section `wg syncconf` reads last. Instead each
+// contended CIDR goes to the most-preferred peer that currently carries routes
+// (lowest spec.routePriority, then name), and the result lists what every other
+// peer must leave out: publicKey -> routeKey -> true.
+//
+// Because carriesRoutes includes the liveness gate, this is also the failover:
+// when the preferred peer goes not-live it stops claiming, the next peer owns
+// the CIDR on the Sync that the liveness transition triggers, and ownership
+// returns the same way on recovery.
+//
+// Pure function over its inputs; the order of `peers` does not affect the
+// result.
+func contendedRoutesLost(peers []v1alpha1.WireguardPeer, src LivenessSource) map[string]map[string]bool {
+	order := make([]int, 0, len(peers))
+	for i := range peers {
+		if carriesRoutes(peers[i], src) {
+			order = append(order, i)
+		}
+	}
+	sort.SliceStable(order, func(a, b int) bool {
+		pa, pb := peers[order[a]], peers[order[b]]
+		if pa.Spec.RoutePriority != pb.Spec.RoutePriority {
+			return pa.Spec.RoutePriority < pb.Spec.RoutePriority
+		}
+		return pa.Name < pb.Name
+	})
+
+	owner := map[string]string{}
+	lost := map[string]map[string]bool{}
+	for _, i := range order {
+		peer := peers[i]
+		for _, routes := range [][]string{peer.Spec.Routes, peer.Spec.RoutesV6} {
+			for _, r := range routes {
+				key := routeKey(r)
+				if key == "" {
+					continue
+				}
+				holder, taken := owner[key]
+				if !taken {
+					owner[key] = peer.Spec.PublicKey
+					continue
+				}
+				if holder == peer.Spec.PublicKey {
+					continue
+				}
+				if lost[peer.Spec.PublicKey] == nil {
+					lost[peer.Spec.PublicKey] = map[string]bool{}
+				}
+				lost[peer.Spec.PublicKey][key] = true
+			}
+		}
+	}
+	return lost
 }
 
 // BuildWgQuickConfig renders the agent's in-memory desired state to a wg-quick
@@ -601,6 +693,8 @@ func BuildWgQuickConfig(state agent.State, listenPort int, src LivenessSource) (
 	var b strings.Builder
 	fmt.Fprintf(&b, "[Interface]\nPrivateKey = %s\nListenPort = %d\n", state.ServerPrivateKey, listenPort)
 
+	lost := contendedRoutesLost(state.Peers, src)
+
 	for _, peer := range state.Peers {
 		if peer.Spec.Disabled {
 			continue
@@ -612,7 +706,7 @@ func BuildWgQuickConfig(state agent.State, listenPort int, src LivenessSource) (
 			continue
 		}
 
-		allowed := peerAllowedIPs(peer, src)
+		allowed := peerAllowedIPsExcept(peer, src, lost[peer.Spec.PublicKey])
 		if allowed == "" {
 			continue
 		}
